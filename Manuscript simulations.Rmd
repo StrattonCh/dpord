@@ -1,0 +1,599 @@
+---
+title: "Manuscript simulations"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+header-includes:
+  - \usepackage{setspace}\doublespacing
+  - \usepackage{mdframed, caption}
+  - \usepackage[linesnumbered,lined,boxed,commentsnumbered]{algorithm2e}
+  - \usepackage{float}
+  - \floatplacement{figure}{H} 
+  - \usepackage{longtable}
+  - \usepackage{blkarray, bigstrut}
+  - \usepackage{booktabs}
+  - \usepackage{multirow}
+---
+
+\newpage
+
+```{r setup, include = F}
+rm(list = ls())
+
+library(knitr)
+hook_chunk <- knitr::knit_hooks$get('chunk')
+knit_hooks$set(chunk = function(x, options) {
+
+  # add latex commands if chunk option singlespacing is TRUE
+  if(isTRUE(options$singlespacing)){
+    return(sprintf("\\singlespacing\n %s \n\\doublespacing", hook_chunk(x, options)))
+  } else{
+    return(hook_chunk(x, options))
+  }
+})
+knitr::opts_chunk$set(
+  fig.align = "center",
+  tidy = T,
+  singlespacing = TRUE,
+  cache = FALSE,
+  fig.dim = c(10,8),
+  message = FALSE,
+  warning = FALSE,
+  comment = NA,
+  echo = F
+)
+
+# packages
+packs <- c("dplyr", "nimble", "htmltools", "ggplot2", "sf", "Rcpp", "RcppArmadillo", "inline", "mvtnorm", "readr", "parallel", "xtable", "rstan", "coda", "vegan", "tidyr", "stringr", "tidyverse", "plotly", "CommEcol")
+sapply(packs, require, character.only = T)
+rm(packs)
+
+# convenience
+`%notin%` <- Negate("%in%")
+options(mc.cores = parallel::detectCores())
+```
+
+```{r}
+nimble_summary <- function(fit, warmup = nrow(fit[[1]])/2, thin = 1){
+  # convert to coda for normal summary
+  fit_warmup <- lapply(fit, function(x) x[(warmup+1):nrow(x),])
+  coda_samples <- as.mcmc.list(lapply(fit_warmup, function(x) as.mcmc(
+    x, start = warmup+1, end = nrow(fit), thin = thin
+  )))
+  
+  sum <- summary(coda_samples)
+  params <- dimnames(sum$statistics)[[1]]
+  tmp_sum <- cbind(sum$statistics, sum$quantiles)
+  
+  # get r hat / n_eff
+  mat <- matrix(NA, nrow = nrow(tmp_sum), ncol = 3)
+  colnames(mat) <- c("Rhat", "ess_bulk", "ess_tail")
+  for(i in 1:nrow(tmp_sum)){
+    tmp <- sapply(fit, function(x) x[,i])
+    mat[i,] <- c(Rhat(tmp), ess_bulk(tmp), ess_tail(tmp))
+  }
+  
+  # out 
+  out <- cbind(tmp_sum, mat)
+  return(out)
+}
+
+fit_model <- function(seed = 1, code, data, constants, inits, niter, nchains, thin = 1){
+  library(nimble)
+  
+  # R model
+  model <- nimbleModel(code, constants, data)
+  
+  # C model
+  model_c <- compileNimble(model)
+  
+  # R mcmc
+  model_conf <- configureMCMC(model)
+  model_conf$addMonitors(c("clus_id", "z"))
+
+  # R mcmc
+  mcmc <- buildMCMC(model_conf)
+  
+  # C mcmc
+  mcmc_c <- compileNimble(mcmc, project = model_c)
+  
+  # run model
+  out <- runMCMC(
+    mcmc_c, 
+    niter = niter, 
+    nchains = nchains, 
+    thin = thin, 
+    init = inits,
+    setSeed = seed
+  )
+  
+  # out
+  return(out)
+}
+
+ord_ls <- function(mcmc, d = 2, seed = NULL, force_K = NULL){
+  # optional seed
+  if(!is.null(seed)) set.seed(seed)
+  
+  # housekeeping
+  mu <- lapply(mcmc, function(x) x[,which(grepl("mu", colnames(x)))])
+  clus_id <- lapply(mcmc, function(x) x[,which(grepl("clus_id", colnames(x)))])
+  other_ndx <- c(1:length(colnames(mcmc[[1]])))[-c(
+    sort(c(
+      which(grepl("clus_id", colnames(mcmc[[1]]))), 
+      which(grepl("mu", colnames(mcmc[[1]])))
+    ))
+  )]
+  other <- lapply(mcmc, function(x) x[,other_ndx])
+  
+  mu_mcmc <- do.call("rbind", mu)
+  clus_mcmc <- do.call("rbind", clus_id)
+  other_mcmc <- do.call("rbind", other)
+  
+  # helper function
+  getmode <- function(v) {
+    uniqv <- unique(v)
+    uniqv[which.max(tabulate(match(v, uniqv)))]
+  }
+  
+  # step 1 - determine number of non-empty cluster for each iteration
+  n_clus_mcmc <- apply(clus_mcmc, 1, function(x) length(unique(x)))
+  
+  # step 2 - estimate the mode
+  if(is.null(force_K)){
+    n_clus_mode <- getmode(n_clus_mcmc)
+  } else{
+    n_clus_mode <- force_K
+  }
+  
+  # step 3 - filter to iterations with n_clus_mcmc = n_clus_mode
+  ## filter first
+  which_equal_mode_index <- which(n_clus_mcmc == n_clus_mode)
+  mu_mcmc_filtered <- mu_mcmc[which_equal_mode_index, ]
+  clus_mcmc_filtered <- clus_mcmc[which_equal_mode_index, ]
+  other_mcmc_filtered <- other_mcmc[which_equal_mode_index, ]
+  
+  ## remove empty clusters - loop
+  mu_reduced <- matrix(NA, nrow = nrow(mu_mcmc_filtered), ncol = n_clus_mode * d)
+  clus_reduced <- array(NA, dim = dim(clus_mcmc_filtered))
+  for(i in 1:length(which_equal_mode_index)){
+    clus_id_i <- sort(unique(clus_mcmc_filtered[i, ]))
+    col_ndx <- which(
+      stringr::str_sub(
+        colnames(mu_mcmc_filtered), 
+        start = stringr::str_locate(colnames(mu_mcmc_filtered), pattern = "\\[")[,1] + 1,
+        end = stringr::str_locate(colnames(mu_mcmc_filtered), pattern = "\\,")[,1] - 1
+      ) %in% clus_id_i
+    )
+    
+    mu_reduced[i, ] <- mu_mcmc_filtered[i,col_ndx]
+    colnames(mu_reduced) <- paste0("mu[", rep(1:n_clus_mode, d), ", ", rep(1:d, each = n_clus_mode), "]")
+    clus_reduced[i, ] <- as.numeric(factor(clus_mcmc_filtered[i,]))
+    colnames(clus_reduced) <- colnames(clus_mcmc_filtered)
+  }
+  
+  # step 4 - create data matrix, cluster with k-means
+  data_matrix <- matrix(
+    c(mu_reduced), 
+    nrow = nrow(mu_reduced) * n_clus_mode,
+    ncol = d
+  )
+  k_means <- kmeans(data_matrix, centers = n_clus_mode)
+  rho <- matrix(k_means$cluster, nrow = nrow(mu_reduced), ncol = n_clus_mode)
+  
+  # step 5 - check whether rho_i is a permutation of 1:n_clus_mode
+  keep_ndx <- which(apply(rho, 1, function(x) all(sort(x) == 1:n_clus_mode)))
+  mu_reduced <- mu_reduced[keep_ndx,]
+  clus_reduced <- clus_reduced[keep_ndx,]
+  other_reduced <- other_mcmc_filtered[keep_ndx, ]
+  rho <- rho[keep_ndx,] %>% as.matrix(., ncol = n_clus_mode)
+  
+  # step 6 - relabel according to rho
+  ## relabel mus first - works, but slow
+  mu_relabeled <- array(NA, dim = dim(mu_reduced))
+  colnames(mu_relabeled) <- colnames(mu_reduced)
+  for(i in 1:nrow(mu_relabeled)){
+    for(j in 1:ncol(mu_relabeled)){
+      # get group id
+      group_id <- stringr::str_sub(
+        colnames(mu_reduced)[j], 
+        start = stringr::str_locate(colnames(mu_reduced)[j], pattern = "\\[")[,1] + 1,
+        end = stringr::str_locate(colnames(mu_reduced)[j], pattern = "\\,")[,1] - 1
+      ) %>% as.numeric()
+      
+      dim_id <- stringr::str_sub(
+        colnames(mu_reduced)[j], 
+        start = stringr::str_locate(colnames(mu_reduced)[j], pattern = "\\,")[,1] + 1,
+        end = stringr::str_locate(colnames(mu_reduced)[j], pattern = "\\]")[,1] - 1
+      ) %>% as.numeric()
+      
+      # replace with proper value according to rho
+      rho_i <- rho[i, ]
+      mu_relabeled[i,j] <- mu_reduced[i, which(
+        colnames(mu_reduced) == paste0("mu[", which(rho_i == group_id), ", ", dim_id, "]")
+      )]
+    }
+  }
+  
+  ## relabel clus_id's
+  clus_relabeled <- array(NA, dim = dim(clus_reduced))
+  colnames(clus_relabeled) <- colnames(clus_reduced)
+  for(i in 1:nrow(clus_relabeled)){
+    rho_i <- rho[i,]
+    clus_id_i <- clus_reduced[i,]
+    clus_relabeled[i,] <- sapply(clus_id_i, function(x) rho_i[x])
+  }
+  
+  out <- list(
+    mu = mu_relabeled, 
+    clus_id = clus_relabeled, 
+    other = other_reduced,
+    which_iter = which_equal_mode_index[keep_ndx]
+  )
+  
+  return(out)
+}
+
+waic_dpord <- function(Y, mcmc, frame_ind, hier = F){
+  if(hier){
+    # get params 
+    mu <- samples_relabeled$mu
+    clus_id <- samples_relabeled$clus_id
+    other <- samples_relabeled$other
+    alpha <- other[,grepl("alpha", colnames(other))]
+    beta <- other[,grepl("beta", colnames(other))]
+    gamma <- other[,grepl("gamma[[]", colnames(other))]
+    z <- other[,grepl("z", colnames(other))]
+    theta <- other[,grepl("theta", colnames(other))]
+    
+    # get dimension
+    d <- sapply(colnames(mu), function(x){
+      str_sub(x, start = nchar(x)-1, end = nchar(x)-1)
+    }) %>% as.numeric %>% max
+    
+    # compute lppd
+    ## lik = alpha[i] + beta[j] + z[i] theta[j] + gamma[i]
+    log_py <- matrix(NA, nrow = nrow(z), ncol = length(c(Y)))
+    message("Calculating log likelihood")
+    pb <- txtProgressBar(min = 0, max = nrow(log_py), style = 3, char = "=")
+    for(iter in 1:nrow(log_py)){
+      alpha_vec_s <- alpha[iter,]
+      beta_vec_s <- beta[iter,]
+      z_matrix_s <- matrix(z[iter,], ncol = d)
+      z_matrix_s <- z_matrix_s[rep(1:nrow(z_matrix_s), table(frame_ind)),]
+      theta_matrix_s <- matrix(theta[iter,], ncol = d)
+      gamma_s <- gamma[iter, ]
+      
+      linpred <- rep(rep(alpha_vec_s, table(frame_ind)), ncol(Y)) +
+        rep(beta_vec_s, each = nrow(Y)) +
+        c(z_matrix_s %*% t(theta_matrix_s)) +
+        rep(gamma_s, ncol(Y))
+      pi <- unname(exp(linpred) / (1 + exp(linpred)))
+      
+      # fix numerical issues
+      pi[which(pi > 0.99999)] <- 0.99999
+      pi[which(pi < 0.00001)] <- 0.00001
+      
+      log_py[iter,] <- c(Y) * log(pi) + (1 - c(Y)) * log(1 - pi)
+      setTxtProgressBar(pb, iter)
+    }
+    close(pb)
+    
+    # compute lppd
+    message("Computing lppd")
+    lppd <- sum(log(colMeans(exp(log_py))))
+    
+    # compute penalty
+    message("Computing penalty")
+    pwaic2 <- sum(apply(log_py, 2, function(x) var(x)))
+    
+    # compute waic
+    waic <- -2*(lppd - pwaic2)
+    out <- waic
+  } else{
+    # get params 
+    mu <- samples_relabeled$mu
+    clus_id <- samples_relabeled$clus_id
+    other <- samples_relabeled$other
+    alpha <- other[,grepl("alpha", colnames(other))]
+    beta <- other[,grepl("beta", colnames(other))]
+    z <- other[,grepl("z", colnames(other))]
+    theta <- other[,grepl("theta", colnames(other))]
+    
+    # get dimension
+    d <- sapply(colnames(mu), function(x){
+      str_sub(x, start = nchar(x)-1, end = nchar(x)-1)
+    }) %>% as.numeric %>% max
+    
+    # compute lppd
+    ## lik = alpha[i] + beta[j] + z[i] theta[j] + gamma[i]
+    log_py <- matrix(NA, nrow = nrow(z), ncol = length(c(Y)))
+    message("Calculating log likelihood")
+    pb <- txtProgressBar(min = 0, max = nrow(log_py), style = 3, char = "=")
+    for(iter in 1:nrow(log_py)){
+      alpha_vec_s <- alpha[iter,]
+      beta_vec_s <- beta[iter,]
+      z_matrix_s <- matrix(z[iter,], ncol = d)
+      theta_matrix_s <- matrix(theta[iter,], ncol = d)
+      
+      linpred <- rep(alpha_vec_s, ncol(Y)) +
+        rep(beta_vec_s, each = nrow(Y)) +
+        c(z_matrix_s %*% t(theta_matrix_s)) 
+      pi <- unname(exp(linpred) / (1 + exp(linpred)))
+      
+      # fix numerical issues
+      pi[which(pi > 0.99999)] <- 0.99999
+      pi[which(pi < 0.00001)] <- 0.00001
+      
+      log_py[iter,] <- c(Y) * log(pi) + (1 - c(Y)) * log(1 - pi)
+      setTxtProgressBar(pb, iter)
+    }
+    close(pb)
+    
+    # compute lppd
+    message("Computing lppd")
+    lppd <- sum(log(colMeans(exp(log_py))))
+    
+    # compute penalty
+    message("Computing penalty")
+    pwaic2 <- sum(apply(log_py, 2, function(x) var(x)))
+    
+    # compute waic
+    waic <- -2*(lppd - pwaic2)
+    out <- waic
+  }
+  
+  return(out)
+}
+
+getmode <- function(v) {
+  uniqv <- unique(v)
+  uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+```
+
+# Introduction
+
+Simulations using COMPAS, similar to Hui.
+
+# Compas example
+
+Generates abundances, switch to presence-absence.
+
+```{r}
+set.seed(02212023)
+coords <- rbind(
+  mvtnorm::rmvnorm(15, c(30, 60), 30*diag(2)),
+  mvtnorm::rmvnorm(15, c(60, 40), 30*diag(2)),
+  mvtnorm::rmvnorm(15, c(80, 60), 30*diag(2))
+)
+plot(coords, col = rep(1:3, each = 15), main = "True latent coordinates")
+mat <- compas(
+  S = 30, 
+  dims = 2,
+  am = c(5, 5),
+  beta.R = c(1, 1), 
+  coords = coords, 
+  n.quanti = 1,
+  n.quali = 0.05, 
+  add1 = 0.05
+)
+# mat[mat > 1] <- 1
+mat <- mat[which(rowSums(mat) != 0),]
+```
+
+## NMDS
+
+```{r}
+nmds <- vegan::metaMDS(
+  mat,
+  distance = "bray", 
+  k = 3
+)
+plot(nmds$points)
+```
+
+## DPORD
+
+```{r}
+library(gmp)
+# probability mass function from Antoniak (1974)
+antoniak <- function(k, alpha, n){
+  alpha <- gmp::as.bigq(as.character(MASS::fractions(alpha)))
+  
+  # A.n first
+  A.n <- function(x, n){
+    sum(abs(gmp::Stirling1.all(n)) * x^(1:n))
+  }
+  
+  # compute mass
+  out <- as.numeric((abs(gmp::Stirling1(n, k)) * alpha^k) / A.n(alpha, n))
+  return(out)
+}
+plot(sapply(1:10, function(x) antoniak(x, 1/1, 45)), main = "Prior mass on number of groups for n = 45, alpha = 1/2")
+```
+
+```{r}
+# model based 
+code <- nimbleCode({
+  # priors
+  phi ~ dunif(0, 10)
+  ## site effects
+  for(site in 1:nsites){
+    alpha[site] ~ dnorm(0, 1)
+  }
+  
+  ## species effects
+  for(species in 1:nspecies){
+    beta[species] ~ dnorm(0, 1)
+  }
+  
+  ## z priors
+  ### Dirichlet process mixture parameters
+  clus_id[1:nsites] ~ dCRP(dp_con, size = nsites)
+  dp_con ~ dgamma(1, 1)
+  
+  ### table parameters - fix covariance as identity
+  for(i in 1:max_clus){
+    mu[i, 1:d] ~ dmnorm(mu0[1:d], Lambda0[1:d, 1:d])
+  }
+  
+  for(site in 1:nsites){
+    # identity matrix for constraint
+    z[site, 1:d] ~ dmnorm(mu[clus_id[site], 1:d], cov = S[1:d, 1:d])
+  }
+  
+  # theta prior
+  ## upper triangle = 0
+  for(row in 1:(d-1)){
+    for(col in (row+1):d){
+      theta[row, col] <- 0
+    }
+  }
+  
+  ## diag > 0
+  for(diag_element in 1:d){
+    theta[diag_element, diag_element] ~ T(dnorm(0, sd = 1), 0, Inf)
+  }
+  
+  ## lower diag of first d rows
+  for(row in 2:d){
+    for(col in 1:(row-1)){
+      theta[row, col] ~ dnorm(0, sd = 1)
+    }
+  }
+  
+  ## all other elements
+  for(row in (d+1):nspecies){
+    for(col in 1:d){
+      theta[row, col] ~ dnorm(0, sd = 1)
+    }
+  }
+  
+  # likelihood 
+  for(site in 1:nsites){
+    for(species in 1:nspecies){
+      log(lambda[site, species]) <- alpha[site] + beta[species] + inprod(z[site,1:d], theta[species, 1:d])
+      nbp[site, species] <- phi / (phi + lambda[site, species])
+      Y[site, species] ~ dnegbin(prob = nbp[site, species], size = phi)
+    }
+  }
+})
+init_func <- function(){
+  d <- 2
+  nrow <- 40
+  nspecies <- 11
+  max_clus <- 40 
+  
+  theta_init <- matrix(rnorm(d * nspecies), nspecies, d)
+  diag(theta_init) <- abs(rnorm(d))
+  theta_init[upper.tri(theta_init)] <- 0
+  
+  list(
+    alpha = rnorm(nrow),
+    beta = rnorm(nspecies),
+    z = matrix(rnorm(nrow * d), nrow, d),
+    theta = theta_init,
+    dp_con = 1,
+    clus_id = sample(c(1, 2), size = nrow, replace = T),
+    mu = matrix(rnorm(d*max_clus), max_clus, d),
+    phi = 1
+  )
+}
+
+this_cluster <- makeCluster(3)
+fit <- parLapply(
+  cl = this_cluster,
+  X = 1001:1003,
+  fun = fit_model,
+  code = code,
+  data = list(
+    Y = mat,
+    S = diag(2),
+    mu0 = rep(0, 2),
+    Lambda0 = diag(2)
+  ),
+  constants = list(
+    nsites = nrow(mat),
+    nspecies = ncol(mat),
+    d = 2,
+    max_clus = 40
+  ),
+  inits = init_func,
+  niter = 10000,
+  nchains = 1,
+  thin = 1
+)
+stopCluster(this_cluster)
+```
+
+```{r}
+fit_ <- fit
+fit <- lapply(fit, function(x) x[(nrow(x)/2 + 1):nrow(x), ])
+samples_relabeled <- ord_ls(mcmc = fit[c(1:3)], d = 2, seed = 02212023)
+
+z_mcmc <- samples_relabeled$other[,which(grepl("z", colnames(samples_relabeled$other)))]
+z_tbl <- left_join(
+  tibble(
+    trace = c(z_mcmc),
+    param = rep(colnames(z_mcmc), each = nrow(z_mcmc)),
+    iter = rep(1:nrow(z_mcmc), length(colnames(z_mcmc))),
+    obs_id = stringr::str_sub(
+      param, 
+      start = stringr::str_locate(param, pattern = "\\[")[,1] + 1,
+      end = stringr::str_locate(param, pattern = "\\,")[,1] - 1
+    ) %>% as.numeric(),
+    dim = stringr::str_sub(
+      param, 
+      start = stringr::str_locate(param, pattern = "\\,")[,1] + 1,
+      end = stringr::str_locate(param, pattern = "\\]")[,1] - 1
+    ) %>% as.numeric()
+  ),
+  tibble(
+    clus_id = c(samples_relabeled$clus_id),
+    iter = rep(1:nrow(samples_relabeled$clus_id), length(colnames(samples_relabeled$clus_id))),
+    obs_id = rep(1:ncol(samples_relabeled$clus_id), each = nrow(samples_relabeled$clus_id))
+  ),
+  by = c("iter", "obs_id")
+)
+
+clus_id <- lapply(fit, function(x) x[,which(grepl("clus_id", colnames(x)))])
+clus_id_all <- do.call("rbind", clus_id)
+ngroups_mcmc <- apply(clus_id_all, 1, function(x) length(unique(x)))
+round(table(ngroups_mcmc) / length(ngroups_mcmc), 3)
+
+z_tbl %>%
+  group_by(obs_id, dim) %>%
+  summarize(
+    mean = mean(trace),
+    clus = getmode(clus_id),
+    clus_prob = mean(clus_id == clus)
+  ) %>%
+  pivot_wider(
+    names_from = dim,
+    values_from = mean, 
+    names_prefix = "z"
+  ) %>%
+  ungroup() %>%
+  mutate(
+    cluster = factor(clus)
+  ) %>% 
+  mutate(
+    obs_id = ifelse(obs_id > 7, obs_id + 1, obs_id)
+  ) %>%
+  ggplot() +
+  geom_text(aes(x = z1, y = z2, col = cluster, label = obs_id)) +
+  theme_bw() +
+  # guides(col = "none") +
+  labs(x = bquote(z[1]), y = bquote(z[2]))
+```
+
+# Simulation
+
+How complex?
+
+
+
+
