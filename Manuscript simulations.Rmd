@@ -508,6 +508,32 @@ saveRDS(compas_data, file = "simulations/compas_data.rds")
 compas_data <- readRDS("simulations/compas_data.rds")
 ```
 
+```{r}
+mat = compas_data[[1]][[1]]$Y
+true_coords = compas_data[[1]][[1]]$true_coords
+k = 2
+sim = 1
+niter = 10000
+nburnin = 5000
+thin = 5
+nchains = 3
+max_clus = 3
+max_attempts = 2
+
+
+one_sim(
+  mat = compas_data[[1]][[1]]$Y,
+  true_coords = compas_data[[1]][[1]]$true_coords,
+  k = 2, 
+  sim = 1, 
+  niter = 100000,
+  nchains = 3,
+  nburnin = 50000,
+  thin = 5,
+  max_clus = 8,
+  max_attempts = 10
+)
+```
 
 
 

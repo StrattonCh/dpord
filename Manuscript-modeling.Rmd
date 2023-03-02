@@ -1,0 +1,4296 @@
+---
+title: "Manuscript modeling"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+header-includes:
+  - \usepackage{setspace}\doublespacing
+  - \usepackage{mdframed, caption}
+  - \usepackage[linesnumbered,lined,boxed,commentsnumbered]{algorithm2e}
+  - \usepackage{float}
+  - \floatplacement{figure}{H} 
+  - \usepackage{longtable}
+  - \usepackage{blkarray, bigstrut}
+  - \usepackage{booktabs}
+  - \usepackage{multirow}
+---
+
+\newpage
+
+```{r setup, include = F}
+rm(list = ls())
+
+library(knitr)
+hook_chunk <- knitr::knit_hooks$get('chunk')
+knit_hooks$set(chunk = function(x, options) {
+
+  # add latex commands if chunk option singlespacing is TRUE
+  if(isTRUE(options$singlespacing)){
+    return(sprintf("\\singlespacing\n %s \n\\doublespacing", hook_chunk(x, options)))
+  } else{
+    return(hook_chunk(x, options))
+  }
+})
+knitr::opts_chunk$set(
+  fig.align = "center",
+  tidy = T,
+  singlespacing = TRUE,
+  cache = FALSE,
+  fig.dim = c(10,8),
+  message = FALSE,
+  warning = FALSE,
+  comment = NA,
+  echo = F
+)
+
+
+# packages
+packs <- c("dplyr", "nimble", "htmltools", "ggplot2", "sf", "Rcpp", "RcppArmadillo", "inline", "mvtnorm", "readr", "parallel", "xtable", "rstan", "coda", "vegan", "tidyr", "stringr", "tidyverse", "plotly")
+sapply(packs, require, character.only = T)
+rm(packs)
+
+# convenience
+`%notin%` <- Negate("%in%")
+options(mc.cores = parallel::detectCores())
+```
+
+```{r}
+nimble_summary <- function(fit, warmup = nrow(fit[[1]])/2, thin = 1){
+  # convert to coda for normal summary
+  fit_warmup <- lapply(fit, function(x) x[(warmup+1):nrow(x),])
+  coda_samples <- as.mcmc.list(lapply(fit_warmup, function(x) as.mcmc(
+    x, start = warmup+1, end = nrow(fit), thin = thin
+  )))
+  
+  sum <- summary(coda_samples)
+  params <- dimnames(sum$statistics)[[1]]
+  tmp_sum <- cbind(sum$statistics, sum$quantiles)
+  
+  # get r hat / n_eff
+  mat <- matrix(NA, nrow = nrow(tmp_sum), ncol = 3)
+  colnames(mat) <- c("Rhat", "ess_bulk", "ess_tail")
+  for(i in 1:nrow(tmp_sum)){
+    tmp <- sapply(fit, function(x) x[,i])
+    mat[i,] <- c(Rhat(tmp), ess_bulk(tmp), ess_tail(tmp))
+  }
+  
+  # out 
+  out <- cbind(tmp_sum, mat)
+  return(out)
+}
+
+fit_model <- function(seed = 1, code, data, constants, inits, niter, nchains, thin = 1){
+  library(nimble)
+  
+  # R model
+  model <- nimbleModel(code, constants, data)
+  
+  # C model
+  model_c <- compileNimble(model)
+  
+  # R mcmc
+  model_conf <- configureMCMC(model)
+  model_conf$addMonitors(c("clus_id", "z"))
+
+  # R mcmc
+  mcmc <- buildMCMC(model_conf)
+  
+  # C mcmc
+  mcmc_c <- compileNimble(mcmc, project = model_c)
+  
+  # run model
+  out <- runMCMC(
+    mcmc_c, 
+    niter = niter, 
+    nchains = nchains, 
+    thin = thin, 
+    init = inits,
+    setSeed = seed
+  )
+  
+  # out
+  return(out)
+}
+
+ord_ls <- function(mcmc, d = 2, seed = NULL, force_K = NULL){
+  # optional seed
+  if(!is.null(seed)) set.seed(seed)
+  
+  # housekeeping
+  mu <- lapply(mcmc, function(x) x[,which(grepl("mu", colnames(x)))])
+  clus_id <- lapply(mcmc, function(x) x[,which(grepl("clus_id", colnames(x)))])
+  other_ndx <- c(1:length(colnames(mcmc[[1]])))[-c(
+    sort(c(
+      which(grepl("clus_id", colnames(mcmc[[1]]))), 
+      which(grepl("mu", colnames(mcmc[[1]])))
+    ))
+  )]
+  other <- lapply(mcmc, function(x) x[,other_ndx])
+  
+  mu_mcmc <- do.call("rbind", mu)
+  clus_mcmc <- do.call("rbind", clus_id)
+  other_mcmc <- do.call("rbind", other)
+  
+  # helper function
+  getmode <- function(v) {
+    uniqv <- unique(v)
+    uniqv[which.max(tabulate(match(v, uniqv)))]
+  }
+  
+  # step 1 - determine number of non-empty cluster for each iteration
+  n_clus_mcmc <- apply(clus_mcmc, 1, function(x) length(unique(x)))
+  
+  # step 2 - estimate the mode
+  if(is.null(force_K)){
+    n_clus_mode <- getmode(n_clus_mcmc)
+  } else{
+    n_clus_mode <- force_K
+  }
+  
+  # step 3 - filter to iterations with n_clus_mcmc = n_clus_mode
+  ## filter first
+  which_equal_mode_index <- which(n_clus_mcmc == n_clus_mode)
+  mu_mcmc_filtered <- mu_mcmc[which_equal_mode_index, ]
+  clus_mcmc_filtered <- clus_mcmc[which_equal_mode_index, ]
+  other_mcmc_filtered <- other_mcmc[which_equal_mode_index, ]
+  
+  ## remove empty clusters - loop
+  mu_reduced <- matrix(NA, nrow = nrow(mu_mcmc_filtered), ncol = n_clus_mode * d)
+  clus_reduced <- array(NA, dim = dim(clus_mcmc_filtered))
+  for(i in 1:length(which_equal_mode_index)){
+    clus_id_i <- sort(unique(clus_mcmc_filtered[i, ]))
+    col_ndx <- which(
+      stringr::str_sub(
+        colnames(mu_mcmc_filtered), 
+        start = stringr::str_locate(colnames(mu_mcmc_filtered), pattern = "\\[")[,1] + 1,
+        end = stringr::str_locate(colnames(mu_mcmc_filtered), pattern = "\\,")[,1] - 1
+      ) %in% clus_id_i
+    )
+    
+    mu_reduced[i, ] <- mu_mcmc_filtered[i,col_ndx]
+    colnames(mu_reduced) <- paste0("mu[", rep(1:n_clus_mode, d), ", ", rep(1:d, each = n_clus_mode), "]")
+    clus_reduced[i, ] <- as.numeric(factor(clus_mcmc_filtered[i,]))
+    colnames(clus_reduced) <- colnames(clus_mcmc_filtered)
+  }
+  
+  # step 4 - create data matrix, cluster with k-means
+  data_matrix <- matrix(
+    c(mu_reduced), 
+    nrow = nrow(mu_reduced) * n_clus_mode,
+    ncol = d
+  )
+  k_means <- kmeans(data_matrix, centers = n_clus_mode)
+  rho <- matrix(k_means$cluster, nrow = nrow(mu_reduced), ncol = n_clus_mode)
+  
+  # step 5 - check whether rho_i is a permutation of 1:n_clus_mode
+  keep_ndx <- which(apply(rho, 1, function(x) all(sort(x) == 1:n_clus_mode)))
+  mu_reduced <- mu_reduced[keep_ndx,]
+  clus_reduced <- clus_reduced[keep_ndx,]
+  other_reduced <- other_mcmc_filtered[keep_ndx, ]
+  rho <- rho[keep_ndx,] %>% as.matrix(., ncol = n_clus_mode)
+  
+  # step 6 - relabel according to rho
+  ## relabel mus first - works, but slow
+  mu_relabeled <- array(NA, dim = dim(mu_reduced))
+  colnames(mu_relabeled) <- colnames(mu_reduced)
+  for(i in 1:nrow(mu_relabeled)){
+    for(j in 1:ncol(mu_relabeled)){
+      # get group id
+      group_id <- stringr::str_sub(
+        colnames(mu_reduced)[j], 
+        start = stringr::str_locate(colnames(mu_reduced)[j], pattern = "\\[")[,1] + 1,
+        end = stringr::str_locate(colnames(mu_reduced)[j], pattern = "\\,")[,1] - 1
+      ) %>% as.numeric()
+      
+      dim_id <- stringr::str_sub(
+        colnames(mu_reduced)[j], 
+        start = stringr::str_locate(colnames(mu_reduced)[j], pattern = "\\,")[,1] + 1,
+        end = stringr::str_locate(colnames(mu_reduced)[j], pattern = "\\]")[,1] - 1
+      ) %>% as.numeric()
+      
+      # replace with proper value according to rho
+      rho_i <- rho[i, ]
+      mu_relabeled[i,j] <- mu_reduced[i, which(
+        colnames(mu_reduced) == paste0("mu[", which(rho_i == group_id), ", ", dim_id, "]")
+      )]
+    }
+  }
+  
+  ## relabel clus_id's
+  clus_relabeled <- array(NA, dim = dim(clus_reduced))
+  colnames(clus_relabeled) <- colnames(clus_reduced)
+  for(i in 1:nrow(clus_relabeled)){
+    rho_i <- rho[i,]
+    clus_id_i <- clus_reduced[i,]
+    clus_relabeled[i,] <- sapply(clus_id_i, function(x) rho_i[x])
+  }
+  
+  out <- list(
+    mu = mu_relabeled, 
+    clus_id = clus_relabeled, 
+    other = other_reduced,
+    which_iter = which_equal_mode_index[keep_ndx]
+  )
+  
+  return(out)
+}
+
+waic_dpord <- function(Y, mcmc, frame_ind, hier = F){
+  if(hier){
+    # get params 
+    mu <- samples_relabeled$mu
+    clus_id <- samples_relabeled$clus_id
+    other <- samples_relabeled$other
+    alpha <- other[,grepl("alpha", colnames(other))]
+    beta <- other[,grepl("beta", colnames(other))]
+    gamma <- other[,grepl("gamma[[]", colnames(other))]
+    z <- other[,grepl("z", colnames(other))]
+    theta <- other[,grepl("theta", colnames(other))]
+    
+    # get dimension
+    d <- sapply(colnames(mu), function(x){
+      str_sub(x, start = nchar(x)-1, end = nchar(x)-1)
+    }) %>% as.numeric %>% max
+    
+    # compute lppd
+    ## lik = alpha[i] + beta[j] + z[i] theta[j] + gamma[i]
+    log_py <- matrix(NA, nrow = nrow(z), ncol = length(c(Y)))
+    message("Calculating log likelihood")
+    pb <- txtProgressBar(min = 0, max = nrow(log_py), style = 3, char = "=")
+    for(iter in 1:nrow(log_py)){
+      alpha_vec_s <- alpha[iter,]
+      beta_vec_s <- beta[iter,]
+      z_matrix_s <- matrix(z[iter,], ncol = d)
+      z_matrix_s <- z_matrix_s[rep(1:nrow(z_matrix_s), table(frame_ind)),]
+      theta_matrix_s <- matrix(theta[iter,], ncol = d)
+      gamma_s <- gamma[iter, ]
+      
+      linpred <- rep(rep(alpha_vec_s, table(frame_ind)), ncol(Y)) +
+        rep(beta_vec_s, each = nrow(Y)) +
+        c(z_matrix_s %*% t(theta_matrix_s)) +
+        rep(gamma_s, ncol(Y))
+      pi <- unname(exp(linpred) / (1 + exp(linpred)))
+      
+      # fix numerical issues
+      pi[which(pi > 0.99999)] <- 0.99999
+      pi[which(pi < 0.00001)] <- 0.00001
+      
+      log_py[iter,] <- c(Y) * log(pi) + (1 - c(Y)) * log(1 - pi)
+      setTxtProgressBar(pb, iter)
+    }
+    close(pb)
+    
+    # compute lppd
+    message("Computing lppd")
+    lppd <- sum(log(colMeans(exp(log_py))))
+    
+    # compute penalty
+    message("Computing penalty")
+    pwaic2 <- sum(apply(log_py, 2, function(x) var(x)))
+    
+    # compute waic
+    waic <- -2*(lppd - pwaic2)
+    out <- waic
+  } else{
+    # get params 
+    mu <- samples_relabeled$mu
+    clus_id <- samples_relabeled$clus_id
+    other <- samples_relabeled$other
+    alpha <- other[,grepl("alpha", colnames(other))]
+    beta <- other[,grepl("beta", colnames(other))]
+    z <- other[,grepl("z", colnames(other))]
+    theta <- other[,grepl("theta", colnames(other))]
+    
+    # get dimension
+    d <- sapply(colnames(mu), function(x){
+      str_sub(x, start = nchar(x)-1, end = nchar(x)-1)
+    }) %>% as.numeric %>% max
+    
+    # compute lppd
+    ## lik = alpha[i] + beta[j] + z[i] theta[j] + gamma[i]
+    log_py <- matrix(NA, nrow = nrow(z), ncol = length(c(Y)))
+    message("Calculating log likelihood")
+    pb <- txtProgressBar(min = 0, max = nrow(log_py), style = 3, char = "=")
+    for(iter in 1:nrow(log_py)){
+      alpha_vec_s <- alpha[iter,]
+      beta_vec_s <- beta[iter,]
+      z_matrix_s <- matrix(z[iter,], ncol = d)
+      theta_matrix_s <- matrix(theta[iter,], ncol = d)
+      
+      linpred <- rep(alpha_vec_s, ncol(Y)) +
+        rep(beta_vec_s, each = nrow(Y)) +
+        c(z_matrix_s %*% t(theta_matrix_s)) 
+      pi <- unname(exp(linpred) / (1 + exp(linpred)))
+      
+      # fix numerical issues
+      pi[which(pi > 0.99999)] <- 0.99999
+      pi[which(pi < 0.00001)] <- 0.00001
+      
+      log_py[iter,] <- c(Y) * log(pi) + (1 - c(Y)) * log(1 - pi)
+      setTxtProgressBar(pb, iter)
+    }
+    close(pb)
+    
+    # compute lppd
+    message("Computing lppd")
+    lppd <- sum(log(colMeans(exp(log_py))))
+    
+    # compute penalty
+    message("Computing penalty")
+    pwaic2 <- sum(apply(log_py, 2, function(x) var(x)))
+    
+    # compute waic
+    waic <- -2*(lppd - pwaic2)
+    out <- waic
+  }
+  
+  return(out)
+}
+```
+
+# CRMO
+
+## Data
+
+````{r}
+craters_data_raw <- readxl::read_excel("craters data/Sage_AnalysisMatrix_wZeros_SppCover_BareGrdCover_PlotsAsRows_CRMO_2019_20210714_1723.xlsx")
+spp_codes <- paste0(
+  str_sub(colnames(craters_data_raw)[6:ncol(craters_data_raw)], start = 1, end = 3),
+  sapply(colnames(craters_data_raw)[6:ncol(craters_data_raw)], function(x) str_sub(x, start = str_locate(x, " ")[1] + 1, end = str_locate(x, " ")[1] + 3))
+) %>% toupper
+spp_codes[c(17:20, 48:49)] <- c("ARTTRID", "ARTTRIP", "ASTSPP", "ASTRSPP", "ERISPP", "ERIOSPP")
+craters_data <- craters_data_raw %>%
+  rename_with(
+    .cols = 6:ncol(.), 
+    ~spp_codes
+  ) %>%
+  select_if(~sum(!is.na(.)) > 0) %>%
+  select_if(~all(is.numeric(.))) %>%
+  select_if(colSums(.) != 0) %>%
+  bind_cols(
+    craters_data_raw %>% dplyr::select(Unit_Code, Loc_Name), 
+    .
+  )
+  
+craters_metadata <- readxl::read_excel("craters data/NPS-SageVegPlots-CRMO-2019-PlotAttributes.xlsx") %>%
+  mutate(frame_num = sapply(strsplit(Sample_Frame, split = "_"), function(x) x[2])) %>%
+  st_as_sf(
+    .,                         
+    coords = c("X_Coord", "Y_Coord"),
+    crs = "+proj=utm +zone=12"
+  ) %>%
+  st_transform(., crs = 4269) 
+boundaries <- read_sf("craters data/nps_boundary")
+crmp_crmo <- boundaries %>% filter(UNIT_CODE %in% c("CRMP", "CRMO"))
+
+# create response matrix
+any_cols <- function(df) {
+  reduce(df, `|`, .init = FALSE)
+}
+
+Y <- craters_data %>%
+  mutate(
+    plot = sapply(stringr::str_split(Loc_Name, pattern = "_"), function(x) x[2])
+  ) %>%
+  group_by(plot) %>%
+  # slice_sample(n = 25) %>%
+  ungroup %>%
+  mutate(row_id = as.character(1:n())) %>%
+  dplyr::select(ACHHYM:ZIGSPP, row_id) %>%
+  # convert to binary
+  mutate_if(is.numeric, ~1 * (. != 0)) %>%
+  # remove species that do not occur in at least 5% of sites
+  select_if(function(col) is.character(col) || sum(col) >= (.05 * length(col))) %>%
+  # remove rows that are all 0
+  filter(any_cols(across(1:(ncol(.)-1), ~. == 1)))
+row_ndx <- Y$row_id %>% as.numeric
+Y <- Y %>%
+  dplyr::select(-row_id) %>%
+  as.matrix()
+
+Y_df <- craters_data %>%
+  mutate(
+    plot = sapply(stringr::str_split(Loc_Name, pattern = "_"), function(x) x[2])
+  ) %>%
+  group_by(plot) %>%
+  ungroup %>%
+  slice(row_ndx)
+
+# data structure to accommodate hierarchical model
+long_df <- Y_df %>%
+  mutate(
+    frame = sapply(stringr::str_split(Y_df$Loc_Name, "_"), function(x) x[2]),
+    quad = sapply(stringr::str_split(Y_df$Loc_Name, "_"), function(x) x[4])
+  ) %>% 
+  select(frame, quad, ACHHYM:ZIGSPP) %>%
+  # pivot_longer(ACHHYM:ZIGSPP, names_to = "species", values_to = "presence") %>%
+  # mutate(presence = ifelse(presence == 0, 0, 1)) %>%
+  mutate(quad = as.numeric(quad)) %>%
+  arrange(frame, quad) %>%
+  mutate(frame_num = as.numeric(factor(frame))) %>%
+  select(frame, frame_num, quad, everything()) %>%
+  mutate(quad_num = 1:n()) %>%
+  select(frame, frame_num, quad, quad_num, everything()) %>%
+  arrange(frame_num, quad_num) %>%
+  select(frame, frame_num, quad, quad_num, colnames(Y))
+```
+
+## Prior on number of groups
+
+```{r, eval = F}
+library(gmp)
+# probability mass function from Antoniak (1974)
+antoniak <- function(k, alpha, n){
+  alpha <- gmp::as.bigq(as.character(MASS::fractions(alpha)))
+  
+  # A.n first
+  A.n <- function(x, n){
+    sum(abs(gmp::Stirling1.all(n)) * x^(1:n))
+  }
+  
+  # compute mass
+  out <- as.numeric((abs(gmp::Stirling1(n, k)) * alpha^k) / A.n(alpha, n))
+  return(out)
+}
+
+plot(sapply(1:10, function(x) antoniak(x, .5/2, 28)), main = "Prior mass on number of groups for n = 1518, alpha = .5/10")
+```
+
+## Models, d = 2, no hierarchy
+
+Presence-absence response are represented by the following GLM:
+
+\begin{equation}
+    y_{ij} | \mu_{ij}, \phi_j \sim f(y_{ij} | \mu_{ij}, \phi_j), \hspace{5mm} g(\mu_{ij}) = \alpha_i + \beta_j + \boldsymbol{z}_i \boldsymbol{\theta}^{T}_j,
+\end{equation}
+
+where $y_{ij}$ is the observed response for species $j$ from quadrat $i$, $f()$ represents the assumed distribution for response $y_{ij}$, $\mu_{ij}$ represents the mean response for species $j$ from site $i$, $\phi_j$ represents the dispersion parameter for species $j$, and $g()$ represents an appropriate link function. Within the link function, $\alpha_i$ represents a site effect that accounts for overall differences in abundance across sites, $\beta_j$ represents a species effect that accounts for overall differences across species, $\boldsymbol{z}_i$ represents the $1 \times d$ row-vector of latent coordinates describing the location of site $i$ in the latent ecological ecological gradient, and $\boldsymbol{\theta}_j$ represents the $1 \times d$ row-vector of species-specific coefficients. 
+
+The second level of the hierarchy draws the latent vectors from a Dirichlet process mixture of multivariate normal distributions:
+\begin{equation}
+\begin{split}
+    \boldsymbol{z}_i | c_i, \boldsymbol{\mu}_1, \dots, \boldsymbol{\mu}_n, \boldsymbol{\Sigma}_{1}, \dots, \boldsymbol{\Sigma}_{n}  &\sim \mathcal{N}(\boldsymbol{\mu}_{c_i}, \boldsymbol{\Sigma}_{c_i}), \\
+    \boldsymbol{\mu_1}, \dots, \boldsymbol{\mu_n}, \boldsymbol{\Sigma}_{1}, \dots, \boldsymbol{\Sigma}_{n} &\sim G, \\
+    G | \alpha_0, G_0 &\sim DP(\alpha_0, G_0),
+\end{split}
+\end{equation}
+where $c_i$ denotes the latent cluster label associated with site $i$, $\alpha_0$ represents the concentration parameter for the Dirichlet process, and $G_0$ represents the base distribution; in the context of ordination, $\alpha_0$ affects the probability of forming new clusters in the latent ecological gradient and $G_0$ is typically chosen to be a multivariate normal distribution with mean $\mu_0$ and covariance matrix $\Sigma_0$.
+
+Posterior mode of 3 clusters, WAIC = 26971.99.
+
+```{r, eval = F}
+# function to fit model
+fit_model <- function(seed = 1, code, data, constants, inits_list, niter, nchains, thin = 1, nburnin = 0){
+  library(nimble)
+  
+  inits <- inits_list[[seed]]
+  
+  # R model
+  model <- nimbleModel(code, constants, data)
+  
+  # C model
+  model_c <- compileNimble(model)
+  
+  # R mcmc
+  model_conf <- configureMCMC(model)
+  model_conf$addMonitors(c("clus_id", "z"))
+  
+  # R mcmc
+  mcmc <- buildMCMC(model_conf)
+  
+  # C mcmc
+  mcmc_c <- compileNimble(mcmc, project = model_c)
+  
+  # run model
+  out <- runMCMC(
+    mcmc_c, 
+    niter = niter, 
+    nchains = nchains, 
+    thin = thin, 
+    init = inits,
+    setSeed = seed,
+    nburnin = nburnin
+  )
+  
+  # out
+  return(out)
+}
+
+# model based
+code <- nimbleCode({
+  # priors
+  ## site effects
+  for(site in 1:nsites){
+    alpha[site] ~ dnorm(0, 1)
+  }
+  
+  ## species effects
+  for(species in 1:nspecies){
+    beta[species] ~ dnorm(0, 1)
+  }
+  
+  ## z priors
+  ### Dirichlet process mixture parameters
+  clus_id[1:nsites] ~ dCRP(dp_con, size = nsites)
+  dp_con ~ dgamma(.5, rate = 10)
+  
+  ### table parameters - fix covariance as identity
+  for(i in 1:max_clus){
+    mu[i, 1:d] ~ dmnorm(mu0[1:d], Lambda0[1:d, 1:d])
+  }
+  
+  for(site in 1:nsites){
+    # identity matrix for constraint
+    z[site, 1:d] ~ dmnorm(mu[clus_id[site], 1:d], cov = S[1:d, 1:d])
+  }
+  
+  # theta prior
+  ## upper triangle = 0
+  for(row in 1:(d-1)){
+    for(col in (row+1):d){
+      theta[row, col] <- 0
+    }
+  }
+  
+  ## diag > 0
+  for(diag_element in 1:d){
+    theta[diag_element, diag_element] ~ T(dnorm(0, sd = 1), 0, Inf)
+  }
+  
+  ## lower diag of first d rows
+  for(row in 2:d){
+    for(col in 1:(row-1)){
+      theta[row, col] ~ dnorm(0, sd = 1)
+    }
+  }
+  
+  ## all other elements
+  for(row in (d+1):nspecies){
+    for(col in 1:d){
+      theta[row, col] ~ dnorm(0, sd = 1)
+    }
+  }
+  
+  # likelihood 
+  for(site in 1:nsites){
+    for(species in 1:nspecies){
+      logit(pi[site, species]) <- alpha[site] + beta[species] + inprod(z[site,1:d], theta[species, 1:d])
+      Y[site, species] ~ dbern(pi[site, species])
+    }
+  }
+})
+
+# inits
+init_function <- function(X, Y, d = 2){
+  library(vegan)
+  
+  # set seed
+  set.seed(X)
+  
+  # housekeeping
+  nrow <- nrow(Y)
+  nspecies <- ncol(Y)
+  max_clus <- 50
+  
+  # mds to initialize z coords
+  mds <- cmdscale(vegdist(Y), eig = TRUE, k = d)
+  z_init <- (mds$points - mean(mds$points)) / sd(mds$points) + rnorm(nrow * d, sd = .5)
+  kmeans <- kmeans(z_init, centers = 4)
+  
+  # theta inits with constraints
+  theta_init <- matrix(rnorm(d * nspecies), nspecies, d)
+  diag(theta_init) <- abs(rnorm(d))
+  theta_init[upper.tri(theta_init)] <- 0
+  
+  out <- list(
+    alpha = rnorm(nrow),
+    beta = rnorm(nspecies),
+    z = z_init + rnorm(nrow * d, sd = .5),
+    theta = theta_init,
+    dp_con = 1,
+    clus_id = kmeans$cluster,
+    mu = rbind(kmeans$centers, matrix(0, nrow = max_clus - nrow(kmeans$centers), ncol = d))
+  )
+} 
+Sys.time()
+library(parallel)
+this_cluster <- makeCluster(3)
+inits_list <- parLapply(
+  cl = this_cluster,
+  X = 1:3,
+  fun = init_function,
+  Y = Y,
+  d = 2
+)
+stopCluster(this_cluster)
+Sys.time()
+
+# fit model
+Sys.time()
+this_cluster <- makeCluster(3)
+fit <- parLapply(
+  cl = this_cluster,
+  X = 1:3,
+  fun = fit_model,
+  code = code,
+  data = list(
+    Y = Y,
+    S = diag(2),
+    mu0 = rep(0, 2),
+    Lambda0 = diag(2)
+  ),
+  constants = list(
+    nsites = nrow(Y),
+    nspecies = ncol(Y),
+    d = 2,
+    max_clus = 50
+  ),
+  inits_list = inits_list,
+  niter = 100000,
+  nchains = 1,
+  thin = 5
+)
+Sys.time()
+stopCluster(this_cluster)
+saveRDS(fit, file = "rds files/manuscript models/crmo_2d_nonhier_1_3.rds")
+```
+
+```{r, eval = F}
+fit <- readRDS("rds files/manuscript models/crmo_2d_nonhier_1_3.rds")
+fit <- lapply(fit, function(x) x[(nrow(x)/2 + 1):nrow(x), ])
+samples_relabeled <- ord_ls(mcmc = fit[c(1:3)], d = 2, seed = 02022022)
+waic_dpord(Y = Y, mcmc = samples_relabeled, frame_ind = NULL, hier = F)
+
+mu_tbl <- tibble(
+  trace = c(samples_relabeled$mu),
+  param = rep(colnames(samples_relabeled$mu), each = nrow(samples_relabeled$mu)),
+  iter = rep(1:nrow(samples_relabeled$mu), length(colnames(samples_relabeled$mu))),
+  chain = 1,
+  clus_id = stringr::str_sub(param, 4, 4), 
+  dim = stringr::str_sub(param, 7, 7)
+)
+
+mu_tbl %>%
+  filter(dim == 1) %>%
+  ggplot(aes(x = iter, y = trace, col = clus_id)) +
+  # facet_wrap(~ chain, labeller = label_both) +
+  geom_line() +
+  theme_bw() +
+  labs(
+    title = bquote("Traceplot for" ~ mu[1] * ", adjusted for label switching")
+  )
+
+mu_tbl %>%
+  filter(dim == 2) %>%
+  ggplot(aes(x = iter, y = trace, col = clus_id)) +
+  # facet_wrap(~ chain, labeller = label_both) +
+  geom_line() +
+  theme_bw() +
+  labs(
+    title = bquote("Traceplot for" ~ mu[2] * ", adjusted for label switching")
+  )
+```
+
+```{r, eval = F}
+getmode <- function(v) {
+  uniqv <- unique(v)
+  uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+z_mcmc <- samples_relabeled$other[,which(grepl("z", colnames(samples_relabeled$other)))]
+z_tbl <- left_join(
+  tibble(
+    trace = c(z_mcmc),
+    param = rep(colnames(z_mcmc), each = nrow(z_mcmc)),
+    iter = rep(1:nrow(z_mcmc), length(colnames(z_mcmc))),
+    obs_id = stringr::str_sub(
+      param, 
+      start = stringr::str_locate(param, pattern = "\\[")[,1] + 1,
+      end = stringr::str_locate(param, pattern = "\\,")[,1] - 1
+    ) %>% as.numeric(),
+    dim = stringr::str_sub(
+      param, 
+      start = stringr::str_locate(param, pattern = "\\,")[,1] + 1,
+      end = stringr::str_locate(param, pattern = "\\]")[,1] - 1
+    ) %>% as.numeric()
+  ),
+  tibble(
+    clus_id = c(samples_relabeled$clus_id),
+    iter = rep(1:nrow(samples_relabeled$clus_id), length(colnames(samples_relabeled$clus_id))),
+    obs_id = rep(1:ncol(samples_relabeled$clus_id), each = nrow(samples_relabeled$clus_id))
+  ),
+  by = c("iter", "obs_id")
+)
+
+# posterior probabilities on numbers of groups
+clus_id <- lapply(fit, function(x) x[,which(grepl("clus_id", colnames(x)))])
+clus_id_all <- do.call("rbind", clus_id)
+ngroups_mcmc <- apply(clus_id_all, 1, function(x) length(unique(x)))
+round(table(ngroups_mcmc) / length(ngroups_mcmc), 3)
+```
+
+## Models, d = 3, no hierarchy
+
+Presence-absence response are represented by the following GLM:
+
+\begin{equation}
+    y_{ij} | \mu_{ij}, \phi_j \sim f(y_{ij} | \mu_{ij}, \phi_j), \hspace{5mm} g(\mu_{ij}) = \alpha_i + \beta_j + \boldsymbol{z}_i \boldsymbol{\theta}^{T}_j,
+\end{equation}
+
+where $y_{ij}$ is the observed response for species $j$ from quadrat $i$, $f()$ represents the assumed distribution for response $y_{ij}$, $\mu_{ij}$ represents the mean response for species $j$ from site $i$, $\phi_j$ represents the dispersion parameter for species $j$, and $g()$ represents an appropriate link function. Within the link function, $\alpha_i$ represents a site effect that accounts for overall differences in abundance across sites, $\beta_j$ represents a species effect that accounts for overall differences across species, $\boldsymbol{z}_i$ represents the $1 \times d$ row-vector of latent coordinates describing the location of site $i$ in the latent ecological ecological gradient, and $\boldsymbol{\theta}_j$ represents the $1 \times d$ row-vector of species-specific coefficients. 
+
+The second level of the hierarchy draws the latent vectors from a Dirichlet process mixture of multivariate normal distributions:
+\begin{equation}
+\begin{split}
+    \boldsymbol{z}_i | c_i, \boldsymbol{\mu}_1, \dots, \boldsymbol{\mu}_n, \boldsymbol{\Sigma}_{1}, \dots, \boldsymbol{\Sigma}_{n}  &\sim \mathcal{N}(\boldsymbol{\mu}_{c_i}, \boldsymbol{\Sigma}_{c_i}), \\
+    \boldsymbol{\mu_1}, \dots, \boldsymbol{\mu_n}, \boldsymbol{\Sigma}_{1}, \dots, \boldsymbol{\Sigma}_{n} &\sim G, \\
+    G | \alpha_0, G_0 &\sim DP(\alpha_0, G_0),
+\end{split}
+\end{equation}
+where $c_i$ denotes the latent cluster label associated with site $i$, $\alpha_0$ represents the concentration parameter for the Dirichlet process, and $G_0$ represents the base distribution; in the context of ordination, $\alpha_0$ affects the probability of forming new clusters in the latent ecological gradient and $G_0$ is typically chosen to be a multivariate normal distribution with mean $\mu_0$ and covariance matrix $\Sigma_0$.
+
+Posterior mode of 4 clusters, WAIC = 25764.28
+
+```{r, eval = F}
+# function to fit model
+fit_model <- function(seed = 1, code, data, constants, inits_list, niter, nchains, thin = 1, nburnin = 0){
+  library(nimble)
+  
+  inits <- inits_list[[seed]]
+  
+  # R model
+  model <- nimbleModel(code, constants, data)
+  
+  # C model
+  model_c <- compileNimble(model)
+  
+  # R mcmc
+  model_conf <- configureMCMC(model)
+  model_conf$addMonitors(c("clus_id", "z"))
+  
+  # R mcmc
+  mcmc <- buildMCMC(model_conf)
+  
+  # C mcmc
+  mcmc_c <- compileNimble(mcmc, project = model_c)
+  
+  # run model
+  out <- runMCMC(
+    mcmc_c, 
+    niter = niter, 
+    nchains = nchains, 
+    thin = thin, 
+    init = inits,
+    setSeed = seed,
+    nburnin = nburnin
+  )
+  
+  # out
+  return(out)
+}
+
+# model based
+code <- nimbleCode({
+  # priors
+  ## site effects
+  for(site in 1:nsites){
+    alpha[site] ~ dnorm(0, 1)
+  }
+  
+  ## species effects
+  for(species in 1:nspecies){
+    beta[species] ~ dnorm(0, 1)
+  }
+  
+  ## z priors
+  ### Dirichlet process mixture parameters
+  clus_id[1:nsites] ~ dCRP(dp_con, size = nsites)
+  dp_con ~ dgamma(.5, rate = 10)
+  
+  ### table parameters - fix covariance as identity
+  for(i in 1:max_clus){
+    mu[i, 1:d] ~ dmnorm(mu0[1:d], Lambda0[1:d, 1:d])
+  }
+  
+  for(site in 1:nsites){
+    # identity matrix for constraint
+    z[site, 1:d] ~ dmnorm(mu[clus_id[site], 1:d], cov = S[1:d, 1:d])
+  }
+  
+  # theta prior
+  ## upper triangle = 0
+  for(row in 1:(d-1)){
+    for(col in (row+1):d){
+      theta[row, col] <- 0
+    }
+  }
+  
+  ## diag > 0
+  for(diag_element in 1:d){
+    theta[diag_element, diag_element] ~ T(dnorm(0, sd = 1), 0, Inf)
+  }
+  
+  ## lower diag of first d rows
+  for(row in 2:d){
+    for(col in 1:(row-1)){
+      theta[row, col] ~ dnorm(0, sd = 1)
+    }
+  }
+  
+  ## all other elements
+  for(row in (d+1):nspecies){
+    for(col in 1:d){
+      theta[row, col] ~ dnorm(0, sd = 1)
+    }
+  }
+  
+  # likelihood 
+  for(site in 1:nsites){
+    for(species in 1:nspecies){
+      logit(pi[site, species]) <- alpha[site] + beta[species] + inprod(z[site,1:d], theta[species, 1:d])
+      Y[site, species] ~ dbern(pi[site, species])
+    }
+  }
+})
+
+# inits
+init_function <- function(X, Y, d = 3){
+  library(vegan)
+  
+  # set seed
+  set.seed(X)
+  
+  # housekeeping
+  nrow <- nrow(Y)
+  nspecies <- ncol(Y)
+  max_clus <- 50
+  
+  # mds to initialize z coords
+  mds <- cmdscale(vegdist(Y), eig = TRUE, k = d)
+  z_init <- (mds$points - mean(mds$points)) / sd(mds$points) + rnorm(nrow * d, sd = .5)
+  kmeans <- kmeans(z_init, centers = 4)
+  
+  # theta inits with constraints
+  theta_init <- matrix(rnorm(d * nspecies), nspecies, d)
+  diag(theta_init) <- abs(rnorm(d))
+  theta_init[upper.tri(theta_init)] <- 0
+  
+  out <- list(
+    alpha = rnorm(nrow),
+    beta = rnorm(nspecies),
+    z = z_init,
+    theta = theta_init,
+    dp_con = 1,
+    clus_id = kmeans$cluster,
+    mu = rbind(kmeans$centers, matrix(0, nrow = max_clus - nrow(kmeans$centers), ncol = d))
+  )
+} 
+Sys.time()
+library(parallel)
+this_cluster <- makeCluster(3)
+inits_list <- parLapply(
+  cl = this_cluster,
+  X = 1:3,
+  fun = init_function,
+  Y = Y,
+  d = 3
+)
+stopCluster(this_cluster)
+Sys.time()
+
+# fit model
+Sys.time()
+this_cluster <- makeCluster(3)
+fit <- parLapply(
+  cl = this_cluster,
+  X = 1:3,
+  fun = fit_model,
+  code = code,
+  data = list(
+    Y = Y,
+    S = diag(3),
+    mu0 = rep(0, 3),
+    Lambda0 = diag(3)
+  ),
+  constants = list(
+    nsites = nrow(Y),
+    nspecies = ncol(Y),
+    d = 3,
+    max_clus = 50
+  ),
+  inits_list = inits_list,
+  niter = 100000,
+  nchains = 1,
+  thin = 5
+)
+Sys.time()
+stopCluster(this_cluster)
+saveRDS(fit, file = "rds files/manuscript models/crmo_3d_nonhier_1_3.rds")
+```
+
+```{r, eval = F}
+fit <- readRDS("rds files/manuscript models/crmo_3d_nonhier_1_3.rds")
+fit <- lapply(fit, function(x) x[(nrow(x)/2 + 1):nrow(x), ])
+samples_relabeled <- ord_ls(mcmc = fit[c(1:3)], d = 3, seed = 02022022)
+waic_dpord(Y = Y, mcmc = samples_relabeled, frame_ind = NULL, hier = F)
+
+mu_tbl <- tibble(
+  trace = c(samples_relabeled$mu),
+  param = rep(colnames(samples_relabeled$mu), each = nrow(samples_relabeled$mu)),
+  iter = rep(1:nrow(samples_relabeled$mu), length(colnames(samples_relabeled$mu))),
+  chain = 1,
+  clus_id = stringr::str_sub(param, 4, 4), 
+  dim = stringr::str_sub(param, 7, 7)
+)
+
+mu_tbl %>%
+  filter(dim == 1) %>%
+  ggplot(aes(x = iter, y = trace, col = clus_id)) +
+  # facet_wrap(~ chain, labeller = label_both) +
+  geom_line() +
+  theme_bw() +
+  labs(
+    title = bquote("Traceplot for" ~ mu[1] * ", adjusted for label switching")
+  )
+
+mu_tbl %>%
+  filter(dim == 2) %>%
+  ggplot(aes(x = iter, y = trace, col = clus_id)) +
+  # facet_wrap(~ chain, labeller = label_both) +
+  geom_line() +
+  theme_bw() +
+  labs(
+    title = bquote("Traceplot for" ~ mu[2] * ", adjusted for label switching")
+  )
+
+mu_tbl %>%
+  filter(dim == 3) %>%
+  ggplot(aes(x = iter, y = trace, col = clus_id)) +
+  # facet_wrap(~ chain, labeller = label_both) +
+  geom_line() +
+  theme_bw() +
+  labs(
+    title = bquote("Traceplot for" ~ mu[2] * ", adjusted for label switching")
+  )
+```
+
+```{r, eval = F}
+getmode <- function(v) {
+  uniqv <- unique(v)
+  uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+z_mcmc <- samples_relabeled$other[,which(grepl("z", colnames(samples_relabeled$other)))]
+z_tbl <- left_join(
+  tibble(
+    trace = c(z_mcmc),
+    param = rep(colnames(z_mcmc), each = nrow(z_mcmc)),
+    iter = rep(1:nrow(z_mcmc), length(colnames(z_mcmc))),
+    obs_id = stringr::str_sub(
+      param, 
+      start = stringr::str_locate(param, pattern = "\\[")[,1] + 1,
+      end = stringr::str_locate(param, pattern = "\\,")[,1] - 1
+    ) %>% as.numeric(),
+    dim = stringr::str_sub(
+      param, 
+      start = stringr::str_locate(param, pattern = "\\,")[,1] + 1,
+      end = stringr::str_locate(param, pattern = "\\]")[,1] - 1
+    ) %>% as.numeric()
+  ),
+  tibble(
+    clus_id = c(samples_relabeled$clus_id),
+    iter = rep(1:nrow(samples_relabeled$clus_id), length(colnames(samples_relabeled$clus_id))),
+    obs_id = rep(1:ncol(samples_relabeled$clus_id), each = nrow(samples_relabeled$clus_id))
+  ),
+  by = c("iter", "obs_id")
+)
+
+# posterior probabilities on numbers of groups
+clus_id <- lapply(fit, function(x) x[,which(grepl("clus_id", colnames(x)))])
+clus_id_all <- do.call("rbind", clus_id)
+ngroups_mcmc <- apply(clus_id_all, 1, function(x) length(unique(x)))
+round(table(ngroups_mcmc) / length(ngroups_mcmc), 3)
+```
+
+```{r, eval = F}
+fig <- z_tbl %>%
+  group_by(obs_id, dim) %>%
+  summarize(
+    mean = mean(trace),
+    clus = getmode(clus_id),
+    clus_prob = mean(clus_id == clus)
+  ) %>%
+  pivot_wider(
+    names_from = dim,
+    values_from = mean, 
+    names_prefix = "z"
+  ) %>%
+  ungroup() %>%
+  mutate(
+    clus_mode = factor(clus)
+  ) %>%
+  plot_ly(
+    x = ~ z1, y = ~ z2, z = ~ z3, color = ~ as.factor(clus_mode)
+  ) %>%
+  add_markers() %>%
+  layout(scene = list(xaxis = list(title = 'z1'),
+                      yaxis = list(title = 'z2'),
+                      zaxis = list(title = 'z3')))
+
+hide_colorbar(fig)
+
+# pairwise
+distance <- function(x, method = "euclidean", func = func){
+  if(method != "custom") {
+    dist.vec <- parallelDist::parDist(x, method = method)
+  } else{
+    dist.vec <- parallelDist::parDist(x, method = method, func = func)
+  }
+  dist <- as.matrix(dist.vec)
+  
+  if(method == "custom") {
+    dist <- dist / ncol(x)
+    diag(dist) <- 1
+  }
+  
+  return(dist)
+}
+
+matchingFuncPtr <- RcppXPtrUtils::cppXPtr(
+'double customDist(const arma::mat &A, const arma::mat &B) {
+  return arma::accu(A == B);
+}', depends = c("RcppArmadillo"))
+# distance(t(ex_matrix), method = "custom", func = matchingFuncPtr)
+
+# data
+clus_id <- samples_relabeled$clus_id
+test <- distance(t(clus_id), method = "custom", func = matchingFuncPtr)
+
+Y_df <- craters_data %>%
+  mutate(
+    plot = sapply(stringr::str_split(Loc_Name, pattern = "_"), function(x) x[2])
+  ) %>%
+  group_by(plot) %>%
+  ungroup %>%
+  slice(row_ndx)
+
+df <- tibble(
+  value = c(test),
+  row = rep(1:1518, 1518),
+  col = rep(1:1518, each = 1518)
+) %>%
+  left_join(
+    ., 
+    Y_df %>%
+      dplyr::select(Loc_Name) %>%
+      mutate(
+        row = 1:n(),
+        site = stringr::str_sub(Loc_Name, 6, 11)
+      ) %>%
+      dplyr::select(row, site) %>%
+      group_by(site) %>%
+      ungroup %>%
+      rename(row_site = site),
+    by = "row"
+  ) %>%
+  left_join(
+    ., 
+    Y_df %>%
+      dplyr::select(Loc_Name) %>%
+      mutate(
+        row = 1:n(),
+        site = stringr::str_sub(Loc_Name, 6, 11)
+      ) %>%
+      dplyr::select(row, site) %>%
+      group_by(site) %>%
+      ungroup %>%
+      rename(col_site = site, col = row),
+    by = "col"
+  ) %>%
+  mutate(
+    row_site_num = stringr::str_sub(row_site, 5, 6),
+    col_site_num = stringr::str_sub(col_site, 5, 6)
+  )
+
+test <- df %>%
+  mutate(tf = ifelse(value >= 0.5, TRUE, FALSE)) %>%
+  group_by(row_site_num, col_site_num) %>%
+  summarize(
+    mean_tf = mean(tf)
+  ) %>%
+  ungroup %>%
+  dplyr::select(mean_tf) %>%
+  unlist %>% 
+  unname %>%
+  matrix(., nrow = 28, ncol = 28)
+
+
+# by quadrats, but labeled by site
+plot_mat <- test
+plot_mat[upper.tri(plot_mat)] <- NA
+fields::image.plot(
+  x = 
+  1:nrow(plot_mat), 
+  1:ncol(plot_mat), 
+  plot_mat,
+  col = gray.colors(n = 128, start = 1, end = 0), 
+  breaks = seq(0, 1, length = 129),
+  axes = F,
+  xlab = "Site number",
+  ylab = "Site number"
+)
+box()
+axis(
+  1, 
+  at = 1:28, 
+  labels =  Y_df %>%
+    dplyr::select(Loc_Name) %>%
+    mutate(
+      row = 1:n(),
+      site = stringr::str_sub(Loc_Name, 6, 11)
+    ) %>%
+    dplyr::select(row, site) %>%
+    group_by(site) %>%
+    slice(round(n()/2)) %>%
+    ungroup %>%
+    mutate(site_num = stringr::str_sub(site, 5, 6)) %>%
+    dplyr::select(site_num) %>%
+    unlist %>% unname,
+  cex.axis = .75
+)
+axis(
+  2, 
+  at = 1:28, 
+  labels =  Y_df %>%
+    dplyr::select(Loc_Name) %>%
+    mutate(
+      row = 1:n(),
+      site = stringr::str_sub(Loc_Name, 6, 11)
+    ) %>%
+    dplyr::select(row, site) %>%
+    group_by(site) %>%
+    slice(round(n()/2)) %>%
+    ungroup %>%
+    mutate(site_num = stringr::str_sub(site, 5, 6)) %>%
+    dplyr::select(site_num) %>%
+    unlist %>% unname,
+  cex.axis = .75
+)
+
+# map with group labels
+map_plot <- z_tbl %>%
+  group_by(obs_id, dim) %>%
+  summarize(
+    mean = mean(trace),
+    clus = getmode(clus_id),
+    clus_prob = mean(clus_id == clus)
+  ) %>%
+  pivot_wider(
+    names_from = dim,
+    values_from = mean, 
+    names_prefix = "z"
+  ) %>%
+  ungroup() %>%
+  mutate(
+    clus_mode = factor(clus)
+  ) %>%
+  left_join(
+    ., 
+    Y_df %>% dplyr::select(Unit_Code, Loc_Name) %>% mutate(obs_id = 1:n()),
+    by = c("obs_id")
+  ) %>%
+  left_join(
+    ., 
+    craters_metadata %>% dplyr::select(Loc_Name, frame_num),
+    by = "Loc_Name"
+  ) %>%
+  group_by(frame_num) %>%
+  summarize(
+    group = getmode(clus_mode),
+    group_prop = mean(group == getmode(clus_mode))
+  ) %>%
+  left_join(
+    craters_metadata,
+    ., 
+    by = "frame_num"
+  ) %>%
+  group_by(Sample_Frame) %>%
+  slice(1) %>% 
+  ungroup
+
+map_plot %>%
+  ggplot() + 
+  geom_sf(data = crmp_crmo, fill = NA) +
+  geom_sf(aes(col = group)) +
+  geom_sf_text(
+    aes(label = frame_num, col = group),
+    size = 3,
+    nudge_x = .01, nudge_y = .01
+  ) +
+  theme_bw()
+
+# with plotly
+plot_tbl <- map_plot %>%
+  bind_cols(., st_coordinates(map_plot)[,1],st_coordinates(map_plot)[,2]) %>%
+  rename(lat = "...18", lon = "...19")
+fig <- plot_tbl %>%
+  plot_ly(
+    lat = ~lat,
+    lon = ~lon,
+    type = "scattermapbox",
+    marker = list(color = "fuchsia")) %>%
+  layout(mapbox= list(
+    style = "white-bg",
+    zoom = 9,
+    center = list(lon = -113.6 ,lat = 43.28),
+    layers = list(list(
+      below = 'traces',
+      sourcetype = "raster",
+      source = list("https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}")
+    ))
+  ))
+
+# with leaflet
+library(leaflet)
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+factpal <- colorFactor(gg_color_hue(4), plot_tbl$group)
+
+leaflet(plot_tbl %>% st_transform(crs = 4326)) %>% 
+  addTiles() %>%
+  setView(lng = -113.6 ,lat = 43.28, zoom = 9) %>%
+  addWMSTiles(
+    "https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}",
+    layers = "USGSImageryOnly"
+  ) %>%
+  addPolygons(
+    data = crmp_crmo %>% st_transform(crs = 4326), 
+    stroke = TRUE, fillOpacity = .15, smoothFactor = 0.5,
+    color = "white",
+    weight = 2
+  ) %>%
+  addCircleMarkers(
+    data = plot_tbl %>% st_transform(crs = 4326),
+    label = as.character(plot_tbl$frame_num),
+    labelOptions = labelOptions(noHide = T,
+                                direction = "right",
+                                textOnly = TRUE,
+                                offset = c(5, -10),
+                                style = list(
+                                  "color" = "yellow",
+                                  "font-family" = "sanserif",
+                                  "font-style" = "bold",
+                                  "font-size" = "14px"
+                                )),
+    fillColor = ~ factpal(group),
+    fill = TRUE,
+    radius = 3, 
+    fillOpacity = .75,
+    weight = 0,
+    opacity = 1
+  )  %>%
+  addLegend(pal = factpal, values = ~group, opacity = 1)
+
+# color by kipuka
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+plot_tbl <- plot_tbl %>%
+  mutate(kipuka = ifelse(frame_num %in% c("19", "20", "25", "26", "27", "28", "35"), "yes", "no"))
+factpal <- colorFactor(gg_color_hue(2), plot_tbl$kipuka)
+
+leaflet(plot_tbl %>% st_transform(crs = 4326)) %>% 
+  addTiles() %>%
+  setView(lng = -113.6 ,lat = 43.28, zoom = 9) %>%
+  addWMSTiles(
+    "https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}",
+    layers = "USGSImageryOnly"
+  ) %>%
+  addPolygons(
+    data = crmp_crmo %>% st_transform(crs = 4326), 
+    stroke = TRUE, fillOpacity = .15, smoothFactor = 0.5,
+    color = "white",
+    weight = 2
+  ) %>%
+  addCircleMarkers(
+    data = plot_tbl %>% st_transform(crs = 4326),
+    label = as.character(plot_tbl$frame_num),
+    labelOptions = labelOptions(noHide = T,
+                                direction = "right",
+                                textOnly = TRUE,
+                                offset = c(5, -10),
+                                style = list(
+                                  "color" = "yellow",
+                                  "font-family" = "sanserif",
+                                  "font-style" = "bold",
+                                  "font-size" = "14px"
+                                )),
+    fillColor = ~ factpal(kipuka),
+    fill = TRUE,
+    radius = 3, 
+    fillOpacity = .75,
+    weight = 0,
+    opacity = 1
+  ) 
+```
+
+```{r, eval = F}
+# interpret results
+Y_ <- craters_data %>%
+  mutate(
+    plot = sapply(stringr::str_split(Loc_Name, pattern = "_"), function(x) x[2])
+  ) %>%
+  group_by(plot) %>%
+  # slice_sample(n = 25) %>%
+  ungroup %>%
+  mutate(row_id = as.character(1:n())) %>%
+  dplyr::select(ACHHYM:ZIGSPP, row_id) %>%
+  # convert to binary
+  mutate_if(is.numeric, ~1 * (. != 0)) %>%
+  # remove species that do not occur in at least 5% of sites
+  select_if(function(col) is.character(col) || sum(col) >= (.05 * length(col))) %>%
+  # remove rows that are all 0
+  filter(any_cols(across(1:(ncol(.)-1), ~. == 1))) %>%
+  bind_cols(
+    craters_data %>%
+      mutate(
+        plot = sapply(stringr::str_split(Loc_Name, pattern = "_"), function(x) x[2])
+      ) %>%
+      group_by(plot) %>%
+      # slice_sample(n = 25) %>%
+      ungroup %>%
+      mutate(row_id = as.character(1:n())) %>%
+      slice(row_ndx) %>%
+      select(plot),
+    .
+  )
+
+# frames 1, 2, 8, 11 - group 4
+## elev gradient
+craters_metadata %>% 
+  group_by(Sample_Frame) %>% 
+  summarize(mean_elev = mean(Elevation)) %>% 
+  arrange(mean_elev) %>%
+  print(n = "all")
+
+## dominant species
+### ARTTRID, BROTEC, ERIOSPP
+Y_ %>%
+  filter(plot %in% c("CRMO01", "CRMO02", "CRMO08", "CRMO11")) %>%
+  select(-plot, -row_id) %>%
+  as.matrix() %>%
+  colSums() / 220
+
+# frames 19, 20, 26, 27, 32, 35
+## dominant species
+### BROTEC 99, POASEC 66, ALLSPP 50, SISALT 49
+Y_ %>%
+  filter(plot %in% c("CRMO19", "CRMO20", "CRMO26", "CRMO27", "CRMO32", "CRMO35")) %>%
+  select(-plot, -row_id) %>%
+  as.matrix() %>%
+  colSums() / 330
+
+# frames 25, 28
+## dominant species
+### poasec 76, achspp 68, phlspp 59, agospp 52
+Y_ %>%
+  filter(plot %in% c("CRMO25", "CRMO28")) %>%
+  select(-plot, -row_id) %>%
+  as.matrix() %>%
+  colSums() / 110
+
+# everything else
+`%notin%` <- Negate("%in%")
+Y_ %>%
+  filter(plot %notin% c(
+    "CRMO19", "CRMO20", "CRMO26", "CRMO27", "CRMO32", "CRMO35", "CRMO25", "CRMO28", "CRMO01", "CRMO02", "CRMO08", "CRMO11"
+  )) %>%
+  select(-plot, -row_id) %>%
+  as.matrix() %>%
+  colSums() / 858
+
+names(craters_data_raw)
+```
+
+## Models, d = 2, hierarchical frame effect - NOT RUN
+
+```{r, eval = F}
+# function to fit model
+fit_model <- function(seed = 1, code, data, constants, inits_list, niter, nchains, thin = 1, nburnin = 0){
+  library(nimble)
+  
+  inits <- inits_list[[seed]]
+  
+  # R model
+  model <- nimbleModel(code, constants, data)
+  
+  # C model
+  model_c <- compileNimble(model)
+  
+  # R mcmc
+  model_conf <- configureMCMC(model)
+  model_conf$addMonitors(c("clus_id", "z", "gamma"))
+  
+  # R mcmc
+  mcmc <- buildMCMC(model_conf)
+  
+  # C mcmc
+  mcmc_c <- compileNimble(mcmc, project = model_c)
+  
+  # run model
+  out <- runMCMC(
+    mcmc_c, 
+    niter = niter, 
+    nchains = nchains, 
+    thin = thin, 
+    init = inits,
+    setSeed = seed,
+    nburnin = nburnin
+  )
+  
+  # out
+  return(out)
+}
+
+# model based
+code <- nimbleCode({
+  # priors
+  ## site effects
+  for(site in 1:nsites){
+    alpha[site] ~ dnorm(0, 1)
+  }
+  
+  ## hierarchical sample frame effect
+  sigma2_gamma ~ T(dnorm(0, var = 1), 0, Inf)
+  for(frame in 1:nframes){
+    gamma[frame] ~ dnorm(0, var = sigma2_gamma)
+  }
+
+  ## species effects
+  for(species in 1:nspecies){
+    beta[species] ~ dnorm(0, 1)
+  }
+  
+  ## z priors
+  ### Dirichlet process mixture parameters
+  clus_id[1:nsites] ~ dCRP(dp_con, size = nsites)
+  dp_con ~ dgamma(.5, rate = 10)
+  
+  ### table parameters - fix covariance as identity
+  for(i in 1:max_clus){
+    mu[i, 1:d] ~ dmnorm(mu0[1:d], Lambda0[1:d, 1:d])
+  }
+  
+  for(site in 1:nsites){
+    # identity matrix for constraint
+    z[site, 1:d] ~ dmnorm(mu[clus_id[site], 1:d], cov = S[1:d, 1:d])
+  }
+  
+  # theta prior
+  ## upper triangle = 0
+  for(row in 1:(d-1)){
+    for(col in (row+1):d){
+      theta[row, col] <- 0
+    }
+  }
+  
+  ## diag > 0
+  for(diag_element in 1:d){
+    theta[diag_element, diag_element] ~ T(dnorm(0, sd = 1), 0, Inf)
+  }
+  
+  ## lower diag of first d rows
+  for(row in 2:d){
+    for(col in 1:(row-1)){
+      theta[row, col] ~ dnorm(0, sd = 1)
+    }
+  }
+  
+  ## all other elements
+  for(row in (d+1):nspecies){
+    for(col in 1:d){
+      theta[row, col] ~ dnorm(0, sd = 1)
+    }
+  }
+  
+  # likelihood 
+  for(site in 1:nsites){
+    for(species in 1:nspecies){
+      logit(pi[site, species]) <- alpha[site] + beta[species] + inprod(z[site,1:d], theta[species, 1:d]) + gamma[frame_ind[site]]
+      Y[site, species] ~ dbern(pi[site, species])
+    }
+  }
+})
+
+# inits
+init_function <- function(X, Y, d = 2){
+  library(vegan)
+  
+  # set seed
+  set.seed(X)
+  
+  # housekeeping
+  nrow <- nrow(Y)
+  nspecies <- ncol(Y)
+  max_clus <- 50
+  
+  # mds to initialize z coords
+  mds <- cmdscale(vegdist(Y), eig = TRUE, k = d)
+  z_init <- (mds$points - mean(mds$points)) / sd(mds$points) + rnorm(nrow * d, sd = .5)
+  kmeans <- kmeans(z_init, centers = 4)
+  
+  # theta inits with constraints
+  theta_init <- matrix(rnorm(d * nspecies), nspecies, d)
+  diag(theta_init) <- abs(rnorm(d))
+  theta_init[upper.tri(theta_init)] <- 0
+  
+  out <- list(
+    alpha = rnorm(nrow),
+    beta = rnorm(nspecies),
+    gamma = rnorm(nframes),
+    z = z_init,
+    theta = theta_init,
+    dp_con = 1,
+    clus_id = kmeans$cluster,
+    mu = rbind(kmeans$centers, matrix(0, nrow = max_clus - nrow(kmeans$centers), ncol = d))
+  )
+} 
+Sys.time()
+library(parallel)
+this_cluster <- makeCluster(3)
+inits_list <- parLapply(
+  cl = this_cluster,
+  X = 1:3,
+  fun = init_function,
+  Y = Y,
+  d = 2
+)
+stopCluster(this_cluster)
+Sys.time()
+
+
+# a little housekeeping
+tmp <- Y_df %>%
+  dplyr::select(Loc_Name) %>%
+  mutate(
+    row = 1:n(),
+    site = stringr::str_sub(Loc_Name, 6, 11)
+  ) %>%
+  dplyr::select(row, site) %>%
+  group_by(site) %>%
+  ungroup %>%
+  rename(col_site = site, col = row)
+
+# fit model
+Sys.time()
+this_cluster <- makeCluster(3)
+fit <- parLapply(
+  cl = this_cluster,
+  X = 1:3,
+  fun = fit_model,
+  code = code,
+  data = list(
+    Y = Y,
+    S = diag(2),
+    mu0 = rep(0, 2),
+    Lambda0 = diag(2)
+  ),
+  constants = list(
+    frame_ind = tmp$col_site %>% factor %>% as.numeric,
+    nsites = nrow(Y),
+    nspecies = ncol(Y),
+    nframes = tmp$col_site %>% unique %>% length,
+    d = 2,
+    max_clus = 50
+  ),
+  inits_list = inits_list,
+  niter = 100000,
+  nchains = 1,
+  thin = 5
+)
+Sys.time()
+stopCluster(this_cluster)
+saveRDS(fit, file = "rds files/manuscript models/crmo_2d_hier_1_3.rds")
+```
+
+```{r, eval = F}
+fit <- readRDS("rds files/manuscript models/crmo_2d_hier_1_3.rds")
+fit <- lapply(fit, function(x) x[(nrow(x)/2 + 1):nrow(x), ])
+samples_relabeled <- ord_ls(mcmc = fit[c(1:3)], d = 2, seed = 02022022)
+waic_dpord(Y = Y, mcmc = samples_relabeled, frame_ind = NULL, hier = T)
+
+# waic
+tmp <- Y_df %>%
+  dplyr::select(Loc_Name) %>%
+  mutate(
+    row = 1:n(),
+    site = stringr::str_sub(Loc_Name, 6, 11)
+  ) %>%
+  dplyr::select(row, site) %>%
+  group_by(site) %>%
+  ungroup %>%
+  rename(col_site = site, col = row)
+waic_dpord(
+  Y = Y, 
+  mcmc = samples_relabeled, 
+  frame_ind = tmp$col_site %>% factor %>% as.numeric, 
+  hier = T
+)
+
+mu_tbl <- tibble(
+  trace = c(samples_relabeled$mu),
+  param = rep(colnames(samples_relabeled$mu), each = nrow(samples_relabeled$mu)),
+  iter = rep(1:nrow(samples_relabeled$mu), length(colnames(samples_relabeled$mu))),
+  chain = 1,
+  clus_id = stringr::str_sub(param, 4, 4), 
+  dim = stringr::str_sub(param, 7, 7)
+)
+
+mu_tbl %>%
+  filter(dim == 1) %>%
+  ggplot(aes(x = iter, y = trace, col = clus_id)) +
+  # facet_wrap(~ chain, labeller = label_both) +
+  geom_line() +
+  theme_bw() +
+  labs(
+    title = bquote("Traceplot for" ~ mu[1] * ", adjusted for label switching")
+  )
+
+mu_tbl %>%
+  filter(dim == 2) %>%
+  ggplot(aes(x = iter, y = trace, col = clus_id)) +
+  # facet_wrap(~ chain, labeller = label_both) +
+  geom_line() +
+  theme_bw() +
+  labs(
+    title = bquote("Traceplot for" ~ mu[2] * ", adjusted for label switching")
+  )
+```
+
+```{r, eval = F}
+getmode <- function(v) {
+  uniqv <- unique(v)
+  uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+z_mcmc <- samples_relabeled$other[,which(grepl("z", colnames(samples_relabeled$other)))]
+z_tbl <- left_join(
+  tibble(
+    trace = c(z_mcmc),
+    param = rep(colnames(z_mcmc), each = nrow(z_mcmc)),
+    iter = rep(1:nrow(z_mcmc), length(colnames(z_mcmc))),
+    obs_id = stringr::str_sub(
+      param, 
+      start = stringr::str_locate(param, pattern = "\\[")[,1] + 1,
+      end = stringr::str_locate(param, pattern = "\\,")[,1] - 1
+    ) %>% as.numeric(),
+    dim = stringr::str_sub(
+      param, 
+      start = stringr::str_locate(param, pattern = "\\,")[,1] + 1,
+      end = stringr::str_locate(param, pattern = "\\]")[,1] - 1
+    ) %>% as.numeric()
+  ),
+  tibble(
+    clus_id = c(samples_relabeled$clus_id),
+    iter = rep(1:nrow(samples_relabeled$clus_id), length(colnames(samples_relabeled$clus_id))),
+    obs_id = rep(1:ncol(samples_relabeled$clus_id), each = nrow(samples_relabeled$clus_id))
+  ),
+  by = c("iter", "obs_id")
+)
+
+# posterior probabilities on numbers of groups
+clus_id <- lapply(fit, function(x) x[,which(grepl("clus_id", colnames(x)))])
+clus_id_all <- do.call("rbind", clus_id)
+ngroups_mcmc <- apply(clus_id_all, 1, function(x) length(unique(x)))
+round(table(ngroups_mcmc) / length(ngroups_mcmc), 3)
+```
+
+## Models, d = 3, hierarchical frame effect - NOT RUN
+
+```{r, eval = F}
+# function to fit model
+fit_model <- function(seed = 1, code, data, constants, inits_list, niter, nchains, thin = 1, nburnin = 0){
+  library(nimble)
+  
+  inits <- inits_list[[seed]]
+  
+  # R model
+  model <- nimbleModel(code, constants, data)
+  
+  # C model
+  model_c <- compileNimble(model)
+  
+  # R mcmc
+  model_conf <- configureMCMC(model)
+  model_conf$addMonitors(c("clus_id", "z", "gamma"))
+  
+  # R mcmc
+  mcmc <- buildMCMC(model_conf)
+  
+  # C mcmc
+  mcmc_c <- compileNimble(mcmc, project = model_c)
+  
+  # run model
+  out <- runMCMC(
+    mcmc_c, 
+    niter = niter, 
+    nchains = nchains, 
+    thin = thin, 
+    init = inits,
+    setSeed = seed,
+    nburnin = nburnin
+  )
+  
+  # out
+  return(out)
+}
+
+# model based
+code <- nimbleCode({
+  # priors
+  ## site effects
+  for(site in 1:nsites){
+    alpha[site] ~ dnorm(0, 1)
+  }
+  
+  ## hierarchical sample frame effect
+  sigma2_gamma ~ T(dnorm(0, var = 1), 0, Inf)
+  for(frame in 1:nframes){
+    gamma[frame] ~ dnorm(0, var = sigma2_gamma)
+  }
+
+  ## species effects
+  for(species in 1:nspecies){
+    beta[species] ~ dnorm(0, 1)
+  }
+  
+  ## z priors
+  ### Dirichlet process mixture parameters
+  clus_id[1:nsites] ~ dCRP(dp_con, size = nsites)
+  dp_con ~ dgamma(.5, rate = 10)
+  
+  ### table parameters - fix covariance as identity
+  for(i in 1:max_clus){
+    mu[i, 1:d] ~ dmnorm(mu0[1:d], Lambda0[1:d, 1:d])
+  }
+  
+  for(site in 1:nsites){
+    # identity matrix for constraint
+    z[site, 1:d] ~ dmnorm(mu[clus_id[site], 1:d], cov = S[1:d, 1:d])
+  }
+  
+  # theta prior
+  ## upper triangle = 0
+  for(row in 1:(d-1)){
+    for(col in (row+1):d){
+      theta[row, col] <- 0
+    }
+  }
+  
+  ## diag > 0
+  for(diag_element in 1:d){
+    theta[diag_element, diag_element] ~ T(dnorm(0, sd = 1), 0, Inf)
+  }
+  
+  ## lower diag of first d rows
+  for(row in 2:d){
+    for(col in 1:(row-1)){
+      theta[row, col] ~ dnorm(0, sd = 1)
+    }
+  }
+  
+  ## all other elements
+  for(row in (d+1):nspecies){
+    for(col in 1:d){
+      theta[row, col] ~ dnorm(0, sd = 1)
+    }
+  }
+  
+  # likelihood 
+  for(site in 1:nsites){
+    for(species in 1:nspecies){
+      logit(pi[site, species]) <- alpha[site] + beta[species] + inprod(z[site,1:d], theta[species, 1:d]) + gamma[frame_ind[site]]
+      Y[site, species] ~ dbern(pi[site, species])
+    }
+  }
+})
+
+# inits
+init_function <- function(X, Y, d = 2){
+  library(vegan)
+  
+  # set seed
+  set.seed(X)
+  
+  # housekeeping
+  nrow <- nrow(Y)
+  nspecies <- ncol(Y)
+  max_clus <- 50
+  
+  # mds to initialize z coords
+  mds <- cmdscale(vegdist(Y), eig = TRUE, k = d)
+  z_init <- (mds$points - mean(mds$points)) / sd(mds$points) + rnorm(nrow * d, sd = .5)
+  kmeans <- kmeans(z_init, centers = 4)
+  
+  # theta inits with constraints
+  theta_init <- matrix(rnorm(d * nspecies), nspecies, d)
+  diag(theta_init) <- abs(rnorm(d))
+  theta_init[upper.tri(theta_init)] <- 0
+  
+  out <- list(
+    alpha = rnorm(nrow),
+    beta = rnorm(nspecies),
+    gamma = rnorm(nframes),
+    z = z_init,
+    theta = theta_init,
+    dp_con = 1,
+    clus_id = kmeans$cluster,
+    mu = rbind(kmeans$centers, matrix(0, nrow = max_clus - nrow(kmeans$centers), ncol = d))
+  )
+} 
+Sys.time()
+library(parallel)
+this_cluster <- makeCluster(3)
+inits_list <- parLapply(
+  cl = this_cluster,
+  X = 1:3,
+  fun = init_function,
+  Y = Y,
+  d = 3
+)
+stopCluster(this_cluster)
+Sys.time()
+
+# a little housekeeping
+tmp <- Y_df %>%
+  dplyr::select(Loc_Name) %>%
+  mutate(
+    row = 1:n(),
+    site = stringr::str_sub(Loc_Name, 6, 11)
+  ) %>%
+  dplyr::select(row, site) %>%
+  group_by(site) %>%
+  ungroup %>%
+  rename(col_site = site, col = row)
+
+# fit model
+Sys.time()
+this_cluster <- makeCluster(3)
+fit <- parLapply(
+  cl = this_cluster,
+  X = 1:3,
+  fun = fit_model,
+  code = code,
+  data = list(
+    Y = Y,
+    S = diag(3),
+    mu0 = rep(0, 3),
+    Lambda0 = diag(3)
+  ),
+  constants = list(
+    frame_ind = tmp$col_site %>% factor %>% as.numeric,
+    nsites = nrow(Y),
+    nspecies = ncol(Y),
+    nframes = tmp$col_site %>% unique %>% length,
+    d = 3,
+    max_clus = 50
+  ),
+  inits_list = inits_list,
+  niter = 100000,
+  nchains = 1,
+  thin = 5
+)
+Sys.time()
+stopCluster(this_cluster)
+saveRDS(fit, file = "rds files/manuscript models/crmo_3d_hier_1_3.rds")
+```
+
+```{r, eval = F}
+fit <- readRDS("rds files/manuscript models/crmo_3d_hier_1_3.rds")
+fit <- lapply(fit, function(x) x[(nrow(x)/2 + 1):nrow(x), ])
+samples_relabeled <- ord_ls(mcmc = fit[c(1:3)], d = 2, seed = 02022022)
+waic_dpord(Y = Y, mcmc = samples_relabeled, frame_ind = NULL, hier = F)
+
+# waic
+tmp <- Y_df %>%
+  dplyr::select(Loc_Name) %>%
+  mutate(
+    row = 1:n(),
+    site = stringr::str_sub(Loc_Name, 6, 11)
+  ) %>%
+  dplyr::select(row, site) %>%
+  group_by(site) %>%
+  ungroup %>%
+  rename(col_site = site, col = row)
+waic_dpord(
+  Y = Y, 
+  mcmc = samples_relabeled, 
+  frame_ind = tmp$col_site %>% factor %>% as.numeric, 
+  hier = T
+)
+
+mu_tbl <- tibble(
+  trace = c(samples_relabeled$mu),
+  param = rep(colnames(samples_relabeled$mu), each = nrow(samples_relabeled$mu)),
+  iter = rep(1:nrow(samples_relabeled$mu), length(colnames(samples_relabeled$mu))),
+  chain = 1,
+  clus_id = stringr::str_sub(param, 4, 4), 
+  dim = stringr::str_sub(param, 7, 7)
+)
+
+mu_tbl %>%
+  filter(dim == 1) %>%
+  ggplot(aes(x = iter, y = trace, col = clus_id)) +
+  # facet_wrap(~ chain, labeller = label_both) +
+  geom_line() +
+  theme_bw() +
+  labs(
+    title = bquote("Traceplot for" ~ mu[1] * ", adjusted for label switching")
+  )
+
+mu_tbl %>%
+  filter(dim == 2) %>%
+  ggplot(aes(x = iter, y = trace, col = clus_id)) +
+  # facet_wrap(~ chain, labeller = label_both) +
+  geom_line() +
+  theme_bw() +
+  labs(
+    title = bquote("Traceplot for" ~ mu[2] * ", adjusted for label switching")
+  )
+```
+
+```{r, eval = F}
+getmode <- function(v) {
+  uniqv <- unique(v)
+  uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+z_mcmc <- samples_relabeled$other[,which(grepl("z", colnames(samples_relabeled$other)))]
+z_tbl <- left_join(
+  tibble(
+    trace = c(z_mcmc),
+    param = rep(colnames(z_mcmc), each = nrow(z_mcmc)),
+    iter = rep(1:nrow(z_mcmc), length(colnames(z_mcmc))),
+    obs_id = stringr::str_sub(
+      param, 
+      start = stringr::str_locate(param, pattern = "\\[")[,1] + 1,
+      end = stringr::str_locate(param, pattern = "\\,")[,1] - 1
+    ) %>% as.numeric(),
+    dim = stringr::str_sub(
+      param, 
+      start = stringr::str_locate(param, pattern = "\\,")[,1] + 1,
+      end = stringr::str_locate(param, pattern = "\\]")[,1] - 1
+    ) %>% as.numeric()
+  ),
+  tibble(
+    clus_id = c(samples_relabeled$clus_id),
+    iter = rep(1:nrow(samples_relabeled$clus_id), length(colnames(samples_relabeled$clus_id))),
+    obs_id = rep(1:ncol(samples_relabeled$clus_id), each = nrow(samples_relabeled$clus_id))
+  ),
+  by = c("iter", "obs_id")
+)
+
+# posterior probabilities on numbers of groups
+clus_id <- lapply(fit, function(x) x[,which(grepl("clus_id", colnames(x)))])
+clus_id_all <- do.call("rbind", clus_id)
+ngroups_mcmc <- apply(clus_id_all, 1, function(x) length(unique(x)))
+round(table(ngroups_mcmc) / length(ngroups_mcmc), 3)
+```
+
+## Models, d = 2, hierarchical quadrat effect, DP on frames
+
+Posterior mode 3 groups, WAIC: 24585.86
+
+```{r, eval = T}
+# function to fit model
+fit_model <- function(seed = 1, code, data, constants, inits_list, niter, nchains, thin = 1, nburnin = 0){
+  library(nimble)
+  
+  inits <- inits_list[[seed]]
+  
+  # R model
+  model <- nimbleModel(code, constants, data)
+  
+  # C model
+  model_c <- compileNimble(model)
+  
+  # R mcmc
+  model_conf <- configureMCMC(model)
+  model_conf$addMonitors(c("clus_id", "z", "gamma"))
+  
+  # R mcmc
+  mcmc <- buildMCMC(model_conf)
+  
+  # C mcmc
+  mcmc_c <- compileNimble(mcmc, project = model_c)
+  
+  # run model
+  out <- runMCMC(
+    mcmc_c, 
+    niter = niter, 
+    nchains = nchains, 
+    thin = thin, 
+    init = inits,
+    setSeed = seed,
+    nburnin = nburnin
+  )
+  
+  # out
+  return(out)
+}
+
+# model based
+code <- nimbleCode({
+  # priors
+  ## site effects
+  for(frame in 1:nframes){
+    alpha[frame] ~ dnorm(0, 1)
+  }
+  
+  ## hierarchical quadrat effect - zero mean
+  gamma_hyper_sigma2 ~ T(dnorm(0, var = 1), 0, Inf)
+  for(frame in 1:nframes){
+    gamma_sigma2[frame] ~ T(dnorm(0, var = gamma_hyper_sigma2), 0, Inf)
+  }
+  for(row in 1:nquad){
+    gamma[row] ~ dnorm(0, var = gamma_sigma2[frame_num[row]])
+  }
+
+  ## species effects
+  for(species in 1:nspecies){
+    beta[species] ~ dnorm(0, 1)
+  }
+  
+  ## z priors
+  ### Dirichlet process mixture parameters
+  clus_id[1:nframes] ~ dCRP(dp_con, size = nframes)
+  dp_con ~ dgamma(1, rate = 2)
+  
+  ### table parameters - fix covariance as identity
+  for(i in 1:max_clus){
+    mu[i, 1:d] ~ dmnorm(mu0[1:d], Lambda0[1:d, 1:d])
+  }
+  
+  for(frame in 1:nframes){
+    # identity matrix for constraint
+    z[frame, 1:d] ~ dmnorm(mu[clus_id[frame], 1:d], cov = S[1:d, 1:d])
+  }
+  
+  # theta prior
+  ## upper triangle = 0
+  for(row in 1:(d-1)){
+    for(col in (row+1):d){
+      theta[row, col] <- 0
+    }
+  }
+  
+  ## diag > 0
+  for(diag_element in 1:d){
+    theta[diag_element, diag_element] ~ T(dnorm(0, sd = 1), 0, Inf)
+  }
+  
+  ## lower diag of first d rows
+  for(row in 2:d){
+    for(col in 1:(row-1)){
+      theta[row, col] ~ dnorm(0, sd = 1)
+    }
+  }
+  
+  ## all other elements
+  for(row in (d+1):nspecies){
+    for(col in 1:d){
+      theta[row, col] ~ dnorm(0, sd = 1)
+    }
+  }
+  
+  # likelihood 
+  for(quad in 1:nquad){
+    for(species in 1:nspecies){
+      logit(pi[quad, species]) <- alpha[frame_num[quad]] + beta[species] + inprod(z[frame_num[quad],1:d], theta[species, 1:d]) + gamma[quad]
+      Y[quad, species] ~ dbern(pi[quad, species])
+    }
+  }
+})
+
+# inits
+init_function <- function(X, long_df, d = 2){
+  library(vegan)
+  library(dplyr)
+  
+  # set seed
+  set.seed(X)
+  
+  # housekeeping
+  nframes <- max(long_df$frame_num)
+  nspecies <- ncol(long_df) - 4
+  nquad <- nrow(long_df)
+  max_clus <- 28
+  
+  # mds to initialize z coords
+  Y_ <- long_df %>% group_by(frame) %>% summarize_at(.vars = vars(ACHSPP:TRADUB), .funs = mean) %>% select(-frame) %>%as.matrix
+  mds <- cmdscale(vegdist(Y_), eig = TRUE, k = d)
+  z_init <- (mds$points - mean(mds$points)) / sd(mds$points)
+  kmeans <- kmeans(z_init, centers = 4)
+  
+  # theta inits with constraints
+  theta_init <- matrix(rnorm(d * nspecies), nspecies, d)
+  diag(theta_init) <- abs(rnorm(d))
+  theta_init[upper.tri(theta_init)] <- 0
+  
+  # random effecst
+  gamma_hyper_sigma2 <- abs(rnorm(1))
+  gamma_sigma2 <- abs(rnorm(nframes, 0, sqrt(gamma_hyper_sigma2)))
+  gamma <- matrix(NA, nrow = nquad, ncol = 1)
+  for(quad in 1:nquad){
+    gamma[quad,] <- rnorm(1, 0, sqrt(gamma_sigma2[long_df$frame_num[quad]]))
+  }
+  
+  out <- list(
+    alpha = rnorm(nframes),
+    beta = rnorm(nspecies),
+    gamma = c(gamma),
+    z = z_init,
+    theta = theta_init,
+    dp_con = 1,
+    clus_id = kmeans$cluster,
+    mu = rbind(kmeans$centers, matrix(0, nrow = max_clus - nrow(kmeans$centers), ncol = d)),
+    gamma_hyper_sigma2 = gamma_hyper_sigma2,
+    gamma_sigma2 = gamma_sigma2
+  )
+} 
+Sys.time()
+library(parallel)
+this_cluster <- makeCluster(3)
+inits_list <- parLapply(
+  cl = this_cluster,
+  X = 1:3,
+  fun = init_function,
+  long_df = long_df,
+  d = 2
+)
+stopCluster(this_cluster)
+Sys.time()
+
+# fit model
+Sys.time()
+this_cluster <- makeCluster(3)
+fit <- parLapply(
+  cl = this_cluster,
+  X = 1:3,
+  fun = fit_model,
+  code = code,
+  data = list(
+    Y = Y,
+    S = diag(2),
+    mu0 = rep(0, 2),
+    Lambda0 = diag(2)
+  ),
+  constants = list(
+    nframes = long_df$frame_num %>% max,
+    nquad = nrow(long_df),
+    nspecies = ncol(long_df) - 4,
+    max_clus = long_df$frame_num %>% max,
+    frame_num = long_df$frame_num,
+    Y = long_df %>% 
+      select(ACHSPP:TRADUB) %>% 
+      mutate_if(is.numeric, ~1 * (. != 0)) %>% 
+      as.matrix,
+    d = 2
+  ),
+  inits_list = inits_list,
+  niter = 150000,
+  nchains = 1,
+  thin = 5
+)
+Sys.time()
+stopCluster(this_cluster)
+saveRDS(fit, file = "rds files/manuscript models/crmo_2d_hier_frames_1_3.rds")
+```
+
+```{r, eval = F}
+fit <- readRDS("rds files/manuscript models/crmo_2d_hier_frames_1_3.rds")
+fit <- lapply(fit, function(x) x[(nrow(x)/2 + 1):nrow(x), ])
+samples_relabeled <- ord_ls(mcmc = fit[c(1:3)], d = 2, seed = 02022022)
+waic_dpord(
+  Y = long_df %>% 
+    select(ACHSPP:TRADUB) %>% 
+    mutate_if(is.numeric, ~1 * (. != 0)) %>% 
+    as.matrix,
+  mcmc = samples_relabeled,
+  frame_ind = long_df$frame_num,
+  hier = T
+)
+
+mu_tbl <- tibble(
+  trace = c(samples_relabeled$mu),
+  param = rep(colnames(samples_relabeled$mu), each = nrow(samples_relabeled$mu)),
+  iter = rep(1:nrow(samples_relabeled$mu), length(colnames(samples_relabeled$mu))),
+  chain = 1,
+  clus_id = stringr::str_sub(param, 4, 4), 
+  dim = stringr::str_sub(param, 7, 7)
+)
+
+mu_tbl %>%
+  filter(dim == 1) %>%
+  ggplot(aes(x = iter, y = trace, col = clus_id)) +
+  # facet_wrap(~ chain, labeller = label_both) +
+  geom_line() +
+  theme_bw() +
+  labs(
+    title = bquote("Traceplot for" ~ mu[1] * ", adjusted for label switching")
+  )
+
+mu_tbl %>%
+  filter(dim == 2) %>%
+  ggplot(aes(x = iter, y = trace, col = clus_id)) +
+  # facet_wrap(~ chain, labeller = label_both) +
+  geom_line() +
+  theme_bw() +
+  labs(
+    title = bquote("Traceplot for" ~ mu[2] * ", adjusted for label switching")
+  )
+```
+
+```{r, eval = F}
+getmode <- function(v) {
+  uniqv <- unique(v)
+  uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+z_mcmc <- samples_relabeled$other[,which(grepl("z", colnames(samples_relabeled$other)))]
+z_tbl <- left_join(
+  tibble(
+    trace = c(z_mcmc),
+    param = rep(colnames(z_mcmc), each = nrow(z_mcmc)),
+    iter = rep(1:nrow(z_mcmc), length(colnames(z_mcmc))),
+    obs_id = stringr::str_sub(
+      param, 
+      start = stringr::str_locate(param, pattern = "\\[")[,1] + 1,
+      end = stringr::str_locate(param, pattern = "\\,")[,1] - 1
+    ) %>% as.numeric(),
+    dim = stringr::str_sub(
+      param, 
+      start = stringr::str_locate(param, pattern = "\\,")[,1] + 1,
+      end = stringr::str_locate(param, pattern = "\\]")[,1] - 1
+    ) %>% as.numeric()
+  ),
+  tibble(
+    clus_id = c(samples_relabeled$clus_id),
+    iter = rep(1:nrow(samples_relabeled$clus_id), length(colnames(samples_relabeled$clus_id))),
+    obs_id = rep(1:ncol(samples_relabeled$clus_id), each = nrow(samples_relabeled$clus_id))
+  ),
+  by = c("iter", "obs_id")
+)
+
+# posterior probabilities on numbers of groups
+clus_id <- lapply(fit, function(x) x[,which(grepl("clus_id", colnames(x)))])
+clus_id_all <- do.call("rbind", clus_id)
+ngroups_mcmc <- apply(clus_id_all, 1, function(x) length(unique(x)))
+round(table(ngroups_mcmc) / length(ngroups_mcmc), 3)
+```
+
+```{r, eval = F}
+# pairwise
+distance <- function(x, method = "euclidean", func = func){
+  if(method != "custom") {
+    dist.vec <- parallelDist::parDist(x, method = method)
+  } else{
+    dist.vec <- parallelDist::parDist(x, method = method, func = func)
+  }
+  dist <- as.matrix(dist.vec)
+  
+  if(method == "custom") {
+    dist <- dist / ncol(x)
+    diag(dist) <- 1
+  }
+  
+  return(dist)
+}
+
+matchingFuncPtr <- RcppXPtrUtils::cppXPtr(
+'double customDist(const arma::mat &A, const arma::mat &B) {
+  return arma::accu(A == B);
+}', depends = c("RcppArmadillo"))
+# distance(t(ex_matrix), method = "custom", func = matchingFuncPtr)
+
+# data
+clus_id <- samples_relabeled$clus_id
+test2 <- distance(t(clus_id), method = "custom", func = matchingFuncPtr)
+
+# by quadrats, but labeled by site
+test <- test2
+test[upper.tri(test)] <- NA
+fields::image.plot(
+  1:nrow(test), 
+  1:ncol(test), 
+  test,
+  col = gray.colors(n=128,start=1,end=0), 
+  breaks = seq(0,1,length=129),
+  axes = F,
+  xlab = "Site number",
+  ylab = "Site number"
+)
+box()
+axis(
+  1, 
+  at = 1:29, 
+  labels = c(1:7, 9:30),
+  cex.axis = .7
+)
+axis(
+  2, 
+  at = 1:29, 
+  labels = c(1:7, 9:30),
+  cex.axis = .77,
+  las = 1
+)
+
+# map with group labels
+map_plot <- z_tbl %>%
+  group_by(obs_id, dim) %>%
+  summarize(
+    mean = mean(trace),
+    clus = getmode(clus_id),
+    clus_prob = mean(clus_id == clus)
+  ) %>%
+  pivot_wider(
+    names_from = dim,
+    values_from = mean, 
+    names_prefix = "z"
+  ) %>%
+  ungroup() %>%
+  mutate(
+    clus_mode = factor(clus)
+  ) %>%
+  left_join(
+    ., 
+    long_df %>% dplyr::select(frame) %>% distinct %>% mutate(obs_id = 1:n()),
+    by = c("obs_id")
+  ) %>%
+  left_join(
+    ., 
+    craters_metadata %>% 
+      dplyr::select(frame_num) %>% 
+      mutate(frame = paste0("CRMO", frame_num)) %>%
+      group_by(frame) %>%
+      slice(1),
+    by = "frame"
+  ) %>%
+  rename(group = clus_mode) %>%
+  st_as_sf()
+
+map_plot %>%
+  ggplot() + 
+  geom_sf(data = crmp_crmo, fill = NA) +
+  geom_sf(aes(col = group)) +
+  geom_sf_text(
+    aes(label = frame_num, col = group),
+    size = 3,
+    nudge_x = .01, nudge_y = .01
+  ) +
+  theme_bw()
+
+# with plotly
+
+# fig <- plot_tbl %>%
+#   plot_ly(
+#     lat = ~lat,
+#     lon = ~lon,
+#     type = "scattermapbox",
+#     marker = list(color = "fuchsia")) %>%
+#   layout(mapbox= list(
+#     style = "white-bg",
+#     zoom = 9,
+#     center = list(lon = -113.6 ,lat = 43.28),
+#     layers = list(list(
+#       below = 'traces',
+#       sourcetype = "raster",
+#       source = list("https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}")
+#     ))
+#   ))
+
+# with leaflet
+plot_tbl <- map_plot %>%
+  bind_cols(., st_coordinates(map_plot)[,1],st_coordinates(map_plot)[,2]) %>%
+  rename(lat = "...11", lon = "...12")
+library(leaflet)
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+factpal <- colorFactor(gg_color_hue(4), plot_tbl$group)
+
+leaflet(plot_tbl %>% st_transform(crs = 4326)) %>% 
+  addTiles() %>%
+  setView(lng = -113.6 ,lat = 43.28, zoom = 9) %>%
+  addWMSTiles(
+    "https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}",
+    layers = "USGSImageryOnly"
+  ) %>%
+  addPolygons(
+    data = crmp_crmo %>% st_transform(crs = 4326), 
+    stroke = TRUE, fillOpacity = .15, smoothFactor = 0.5,
+    color = "white",
+    weight = 2
+  ) %>%
+  addCircleMarkers(
+    data = plot_tbl %>% st_transform(crs = 4326),
+    label = as.character(plot_tbl$frame_num),
+    labelOptions = labelOptions(noHide = T,
+                                direction = "right",
+                                textOnly = TRUE,
+                                offset = c(5, -10),
+                                style = list(
+                                  "color" = "yellow",
+                                  "font-family" = "sanserif",
+                                  "font-style" = "bold",
+                                  "font-size" = "14px"
+                                )),
+    fillColor = ~ factpal(group),
+    fill = TRUE,
+    radius = 3, 
+    fillOpacity = .75,
+    weight = 0,
+    opacity = 1
+  )  %>%
+  addLegend(pal = factpal, values = ~group, opacity = 1)
+
+# color by kipuka
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+plot_tbl <- plot_tbl %>%
+  mutate(kipuka = ifelse(frame_num %in% c("19", "20", "25", "26", "27", "28", "35"), "yes", "no"))
+factpal <- colorFactor(gg_color_hue(2), plot_tbl$kipuka)
+
+leaflet(plot_tbl %>% st_transform(crs = 4326)) %>% 
+  addTiles() %>%
+  setView(lng = -113.6 ,lat = 43.28, zoom = 9) %>%
+  addWMSTiles(
+    "https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}",
+    layers = "USGSImageryOnly"
+  ) %>%
+  addPolygons(
+    data = crmp_crmo %>% st_transform(crs = 4326), 
+    stroke = TRUE, fillOpacity = .15, smoothFactor = 0.5,
+    color = "white",
+    weight = 2
+  ) %>%
+  addCircleMarkers(
+    data = plot_tbl %>% st_transform(crs = 4326),
+    label = as.character(plot_tbl$frame_num),
+    labelOptions = labelOptions(noHide = T,
+                                direction = "right",
+                                textOnly = TRUE,
+                                offset = c(5, -10),
+                                style = list(
+                                  "color" = "yellow",
+                                  "font-family" = "sanserif",
+                                  "font-style" = "bold",
+                                  "font-size" = "14px"
+                                )),
+    fillColor = ~ factpal(kipuka),
+    fill = TRUE,
+    radius = 3, 
+    fillOpacity = .75,
+    weight = 0,
+    opacity = 1
+  ) 
+```
+
+```{r, eval = F}
+# interpret results
+Y_ <- craters_data %>%
+  mutate(
+    plot = sapply(stringr::str_split(Loc_Name, pattern = "_"), function(x) x[2])
+  ) %>%
+  group_by(plot) %>%
+  # slice_sample(n = 25) %>%
+  ungroup %>%
+  mutate(row_id = as.character(1:n())) %>%
+  dplyr::select(ACHHYM:ZIGSPP, row_id) %>%
+  # convert to binary
+  mutate_if(is.numeric, ~1 * (. != 0)) %>%
+  # remove species that do not occur in at least 5% of sites
+  select_if(function(col) is.character(col) || sum(col) >= (.05 * length(col))) %>%
+  # remove rows that are all 0
+  filter(any_cols(across(1:(ncol(.)-1), ~. == 1))) %>%
+  bind_cols(
+    craters_data %>%
+      mutate(
+        plot = sapply(stringr::str_split(Loc_Name, pattern = "_"), function(x) x[2])
+      ) %>%
+      group_by(plot) %>%
+      # slice_sample(n = 25) %>%
+      ungroup %>%
+      mutate(row_id = as.character(1:n())) %>%
+      slice(row_ndx) %>%
+      select(plot),
+    .
+  )
+
+# frames 1, 2, 8, 11 - group 4
+## elev gradient
+craters_metadata %>% 
+  group_by(Sample_Frame) %>% 
+  summarize(mean_elev = mean(Elevation)) %>% 
+  arrange(mean_elev) %>%
+  print(n = "all")
+
+## dominant species
+### ARTTRID, BROTEC, ERIOSPP
+Y_ %>%
+  filter(plot %in% c("CRMO01", "CRMO02", "CRMO08", "CRMO11")) %>%
+  select(-plot, -row_id) %>%
+  as.matrix() %>%
+  colSums() / 220
+
+# frames 19, 20, 26, 27, 32, 35
+## dominant species
+### BROTEC 99, POASEC 66, ALLSPP 50, SISALT 49
+Y_ %>%
+  filter(plot %in% c("CRMO19", "CRMO20", "CRMO26", "CRMO27", "CRMO32", "CRMO35")) %>%
+  select(-plot, -row_id) %>%
+  as.matrix() %>%
+  colSums() / 330
+
+# frames 25, 28
+## dominant species
+### poasec 76, achspp 68, phlspp 59, agospp 52
+Y_ %>%
+  filter(plot %in% c("CRMO25", "CRMO28")) %>%
+  select(-plot, -row_id) %>%
+  as.matrix() %>%
+  colSums() / 110
+
+# everything else
+`%notin%` <- Negate("%in%")
+Y_ %>%
+  filter(plot %notin% c(
+    "CRMO19", "CRMO20", "CRMO26", "CRMO27", "CRMO32", "CRMO35", "CRMO25", "CRMO28", "CRMO01", "CRMO02", "CRMO08", "CRMO11"
+  )) %>%
+  select(-plot, -row_id) %>%
+  as.matrix() %>%
+  colSums() / 858
+
+names(craters_data_raw)
+```
+
+## Models, d = 3, hierarchical quadrat effect, DP on frames
+
+Posterior mode 4 groups, WAIC 23353.19
+
+```{r, eval = F}
+# function to fit model
+fit_model <- function(seed = 1, code, data, constants, inits_list, niter, nchains, thin = 1, nburnin = 0){
+  library(nimble)
+  
+  inits <- inits_list[[seed]]
+  
+  # R model
+  model <- nimbleModel(code, constants, data)
+  
+  # C model
+  model_c <- compileNimble(model)
+  
+  # R mcmc
+  model_conf <- configureMCMC(model)
+  model_conf$addMonitors(c("clus_id", "z", "gamma"))
+  
+  # R mcmc
+  mcmc <- buildMCMC(model_conf)
+  
+  # C mcmc
+  mcmc_c <- compileNimble(mcmc, project = model_c)
+  
+  # run model
+  out <- runMCMC(
+    mcmc_c, 
+    niter = niter, 
+    nchains = nchains, 
+    thin = thin, 
+    init = inits,
+    setSeed = seed,
+    nburnin = nburnin
+  )
+  
+  # out
+  return(out)
+}
+
+# model based
+code <- nimbleCode({
+  # priors
+  ## site effects
+  for(frame in 1:nframes){
+    alpha[frame] ~ dnorm(0, 1)
+  }
+  
+  ## hierarchical quadrat effect - zero mean
+  gamma_hyper_sigma2 ~ T(dnorm(0, var = 1), 0, Inf)
+  for(frame in 1:nframes){
+    gamma_sigma2[frame] ~ T(dnorm(0, var = gamma_hyper_sigma2), 0, Inf)
+  }
+  for(row in 1:nquad){
+    gamma[row] ~ dnorm(0, var = gamma_sigma2[frame_num[row]])
+  }
+
+  ## species effects
+  for(species in 1:nspecies){
+    beta[species] ~ dnorm(0, 1)
+  }
+  
+  ## z priors
+  ### Dirichlet process mixture parameters
+  clus_id[1:nframes] ~ dCRP(dp_con, size = nframes)
+  dp_con ~ dgamma(1, rate = 2)
+  
+  ### table parameters - fix covariance as identity
+  for(i in 1:max_clus){
+    mu[i, 1:d] ~ dmnorm(mu0[1:d], Lambda0[1:d, 1:d])
+  }
+  
+  for(frame in 1:nframes){
+    # identity matrix for constraint
+    z[frame, 1:d] ~ dmnorm(mu[clus_id[frame], 1:d], cov = S[1:d, 1:d])
+  }
+  
+  # theta prior
+  ## upper triangle = 0
+  for(row in 1:(d-1)){
+    for(col in (row+1):d){
+      theta[row, col] <- 0
+    }
+  }
+  
+  ## diag > 0
+  for(diag_element in 1:d){
+    theta[diag_element, diag_element] ~ T(dnorm(0, sd = 1), 0, Inf)
+  }
+  
+  ## lower diag of first d rows
+  for(row in 2:d){
+    for(col in 1:(row-1)){
+      theta[row, col] ~ dnorm(0, sd = 1)
+    }
+  }
+  
+  ## all other elements
+  for(row in (d+1):nspecies){
+    for(col in 1:d){
+      theta[row, col] ~ dnorm(0, sd = 1)
+    }
+  }
+  
+  # likelihood 
+  for(quad in 1:nquad){
+    for(species in 1:nspecies){
+      logit(pi[quad, species]) <- alpha[frame_num[quad]] + beta[species] + inprod(z[frame_num[quad],1:d], theta[species, 1:d]) + gamma[quad]
+      Y[quad, species] ~ dbern(pi[quad, species])
+    }
+  }
+})
+
+# inits
+init_function <- function(X, long_df, d = 2){
+  library(vegan)
+  library(dplyr)
+  
+  # set seed
+  set.seed(X)
+  
+  # housekeeping
+  nframes <- max(long_df$frame_num)
+  nspecies <- ncol(long_df) - 4
+  nquad <- nrow(long_df)
+  max_clus <- 28
+  
+  # mds to initialize z coords
+  Y_ <- long_df %>% group_by(frame) %>% summarize_at(.vars = vars(ACHSPP:TRADUB), .funs = mean) %>% select(-frame) %>%as.matrix
+  mds <- cmdscale(vegdist(Y_), eig = TRUE, k = d)
+  z_init <- (mds$points - mean(mds$points)) / sd(mds$points)
+  kmeans <- kmeans(z_init, centers = 4)
+  
+  # theta inits with constraints
+  theta_init <- matrix(rnorm(d * nspecies), nspecies, d)
+  diag(theta_init) <- abs(rnorm(d))
+  theta_init[upper.tri(theta_init)] <- 0
+  
+  # random effecst
+  gamma_hyper_sigma2 <- abs(rnorm(1))
+  gamma_sigma2 <- abs(rnorm(nframes, 0, sqrt(gamma_hyper_sigma2)))
+  gamma <- matrix(NA, nrow = nquad, ncol = 1)
+  for(quad in 1:nquad){
+    gamma[quad,] <- rnorm(1, 0, sqrt(gamma_sigma2[long_df$frame_num[quad]]))
+  }
+  
+  out <- list(
+    alpha = rnorm(nframes),
+    beta = rnorm(nspecies),
+    gamma = c(gamma),
+    z = z_init,
+    theta = theta_init,
+    dp_con = 1,
+    clus_id = kmeans$cluster,
+    mu = rbind(kmeans$centers, matrix(0, nrow = max_clus - nrow(kmeans$centers), ncol = d)),
+    gamma_hyper_sigma2 = gamma_hyper_sigma2,
+    gamma_sigma2 = gamma_sigma2
+  )
+} 
+Sys.time()
+library(parallel)
+this_cluster <- makeCluster(3)
+inits_list <- parLapply(
+  cl = this_cluster,
+  X = 1:3,
+  fun = init_function,
+  long_df = long_df,
+  d = 3
+)
+stopCluster(this_cluster)
+Sys.time()
+
+# fit model
+Sys.time()
+this_cluster <- makeCluster(3)
+fit <- parLapply(
+  cl = this_cluster,
+  X = 1:3,
+  fun = fit_model,
+  code = code,
+  data = list(
+    Y = Y,
+    S = diag(3),
+    mu0 = rep(0, 3),
+    Lambda0 = diag(3)
+  ),
+  constants = list(
+    nframes = long_df$frame_num %>% max,
+    nquad = nrow(long_df),
+    nspecies = ncol(long_df) - 4,
+    max_clus = long_df$frame_num %>% max,
+    frame_num = long_df$frame_num,
+    Y = long_df %>% 
+      select(ACHSPP:TRADUB) %>% 
+      mutate_if(is.numeric, ~1 * (. != 0)) %>% 
+      as.matrix,
+    d = 3
+  ),
+  inits_list = inits_list,
+  niter = 150000,
+  nchains = 1,
+  thin = 5
+)
+Sys.time()
+stopCluster(this_cluster)
+saveRDS(fit, file = "rds files/manuscript models/crmo_3d_hier_frames_1_3.rds")
+```
+
+```{r, eval = F}
+fit <- readRDS("rds files/manuscript models/crmo_3d_hier_frames_1_3.rds")
+fit <- lapply(fit, function(x) x[(nrow(x)/2 + 1):nrow(x), ])
+samples_relabeled <- ord_ls(mcmc = fit[c(1:3)], d = 3, seed = 02022022)
+waic_dpord(
+  Y = long_df %>% 
+    select(ACHSPP:TRADUB) %>% 
+    mutate_if(is.numeric, ~1 * (. != 0)) %>% 
+    as.matrix,
+  mcmc = samples_relabeled,
+  frame_ind = long_df$frame_num,
+  hier = T
+)
+
+mu_tbl <- tibble(
+  trace = c(samples_relabeled$mu),
+  param = rep(colnames(samples_relabeled$mu), each = nrow(samples_relabeled$mu)),
+  iter = rep(1:nrow(samples_relabeled$mu), length(colnames(samples_relabeled$mu))),
+  chain = 1,
+  clus_id = stringr::str_sub(param, 4, 4), 
+  dim = stringr::str_sub(param, 7, 7)
+)
+
+mu_tbl %>%
+  filter(dim == 1) %>%
+  ggplot(aes(x = iter, y = trace, col = clus_id)) +
+  # facet_wrap(~ chain, labeller = label_both) +
+  geom_line() +
+  theme_bw() +
+  labs(
+    title = bquote("Traceplot for" ~ mu[1] * ", adjusted for label switching")
+  )
+
+mu_tbl %>%
+  filter(dim == 2) %>%
+  ggplot(aes(x = iter, y = trace, col = clus_id)) +
+  # facet_wrap(~ chain, labeller = label_both) +
+  geom_line() +
+  theme_bw() +
+  labs(
+    title = bquote("Traceplot for" ~ mu[2] * ", adjusted for label switching")
+  )
+```
+
+```{r, eval = F}
+getmode <- function(v) {
+  uniqv <- unique(v)
+  uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+z_mcmc <- samples_relabeled$other[,which(grepl("z", colnames(samples_relabeled$other)))]
+z_tbl <- left_join(
+  tibble(
+    trace = c(z_mcmc),
+    param = rep(colnames(z_mcmc), each = nrow(z_mcmc)),
+    iter = rep(1:nrow(z_mcmc), length(colnames(z_mcmc))),
+    obs_id = stringr::str_sub(
+      param, 
+      start = stringr::str_locate(param, pattern = "\\[")[,1] + 1,
+      end = stringr::str_locate(param, pattern = "\\,")[,1] - 1
+    ) %>% as.numeric(),
+    dim = stringr::str_sub(
+      param, 
+      start = stringr::str_locate(param, pattern = "\\,")[,1] + 1,
+      end = stringr::str_locate(param, pattern = "\\]")[,1] - 1
+    ) %>% as.numeric()
+  ),
+  tibble(
+    clus_id = c(samples_relabeled$clus_id),
+    iter = rep(1:nrow(samples_relabeled$clus_id), length(colnames(samples_relabeled$clus_id))),
+    obs_id = rep(1:ncol(samples_relabeled$clus_id), each = nrow(samples_relabeled$clus_id))
+  ),
+  by = c("iter", "obs_id")
+)
+
+# posterior probabilities on numbers of groups
+clus_id <- lapply(fit, function(x) x[,which(grepl("clus_id", colnames(x)))])
+clus_id_all <- do.call("rbind", clus_id)
+ngroups_mcmc <- apply(clus_id_all, 1, function(x) length(unique(x)))
+round(table(ngroups_mcmc) / length(ngroups_mcmc), 3)
+```
+
+```{r, eval = F}
+fig <- z_tbl %>%
+  group_by(obs_id, dim) %>%
+  summarize(
+    mean = mean(trace),
+    clus = getmode(clus_id),
+    clus_prob = mean(clus_id == clus)
+  ) %>%
+  pivot_wider(
+    names_from = dim,
+    values_from = mean, 
+    names_prefix = "z"
+  ) %>%
+  ungroup() %>%
+  mutate(
+    clus_mode = factor(clus)
+  ) %>%
+  plot_ly(
+    x = ~ z1, y = ~ z2, z = ~ z3, color = ~ as.factor(clus_mode), symbol = ~clus_mode
+  ) %>%
+  add_markers() %>%
+  layout(scene = list(xaxis = list(title = 'z1'),
+                      yaxis = list(title = 'z2'),
+                      zaxis = list(title = 'z3')),
+         legend = list(orientation = 'h'))
+
+hide_colorbar(fig)
+
+# pairwise
+distance <- function(x, method = "euclidean", func = func){
+  if(method != "custom") {
+    dist.vec <- parallelDist::parDist(x, method = method)
+  } else{
+    dist.vec <- parallelDist::parDist(x, method = method, func = func)
+  }
+  dist <- as.matrix(dist.vec)
+  
+  if(method == "custom") {
+    dist <- dist / ncol(x)
+    diag(dist) <- 1
+  }
+  
+  return(dist)
+}
+
+matchingFuncPtr <- RcppXPtrUtils::cppXPtr(
+'double customDist(const arma::mat &A, const arma::mat &B) {
+  return arma::accu(A == B);
+}', depends = c("RcppArmadillo"))
+# distance(t(ex_matrix), method = "custom", func = matchingFuncPtr)
+
+# data
+clus_id <- samples_relabeled$clus_id
+test2 <- distance(t(clus_id), method = "custom", func = matchingFuncPtr)
+
+# by quadrats, but labeled by site
+test <- test2
+test[upper.tri(test)] <- NA
+fields::image.plot(
+  1:nrow(test), 
+  1:ncol(test), 
+  test,
+  col = gray.colors(n=128,start=1,end=0), 
+  breaks = seq(0,1,length=129),
+  axes = F,
+  xlab = "Sample frame",
+  ylab = "Sample frame"
+)
+box()
+axis(
+  1, 
+  at = 1:28, 
+  labels = craters_metadata$frame_num %>% unique,
+  cex.axis = .7
+)
+axis(
+  2, 
+  at = 1:28, 
+  labels = craters_metadata$frame_num %>% unique,
+  cex.axis = .77,
+  las = 1
+)
+
+# map with group labels
+map_plot <- z_tbl %>%
+  group_by(obs_id, dim) %>%
+  summarize(
+    mean = mean(trace),
+    clus = getmode(clus_id),
+    clus_prob = mean(clus_id == clus)
+  ) %>%
+  pivot_wider(
+    names_from = dim,
+    values_from = mean, 
+    names_prefix = "z"
+  ) %>%
+  ungroup() %>%
+  mutate(
+    clus_mode = factor(clus)
+  ) %>%
+  left_join(
+    ., 
+    long_df %>% dplyr::select(frame) %>% distinct %>% mutate(obs_id = 1:n()),
+    by = c("obs_id")
+  ) %>%
+  left_join(
+    ., 
+    craters_metadata %>% 
+      dplyr::select(frame_num) %>% 
+      mutate(frame = paste0("CRMO", frame_num)) %>%
+      group_by(frame) %>%
+      slice(1),
+    by = "frame"
+  ) %>%
+  rename(group = clus_mode) %>%
+  st_as_sf()
+
+map_plot %>%
+  ggplot() + 
+  geom_sf(data = crmp_crmo, fill = NA) +
+  geom_sf(aes(col = group)) +
+  geom_sf_text(
+    aes(label = frame_num, col = group),
+    size = 3,
+    nudge_x = .01, nudge_y = .01
+  ) +
+  theme_bw()
+
+# with plotly
+
+# fig <- plot_tbl %>%
+#   plot_ly(
+#     lat = ~lat,
+#     lon = ~lon,
+#     type = "scattermapbox",
+#     marker = list(color = "fuchsia")) %>%
+#   layout(mapbox= list(
+#     style = "white-bg",
+#     zoom = 9,
+#     center = list(lon = -113.6 ,lat = 43.28),
+#     layers = list(list(
+#       below = 'traces',
+#       sourcetype = "raster",
+#       source = list("https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}")
+#     ))
+#   ))
+
+# with leaflet
+plot_tbl <- map_plot %>%
+  bind_cols(., st_coordinates(map_plot)[,1],st_coordinates(map_plot)[,2]) %>%
+  rename(lat = "...11", lon = "...12")
+library(leaflet)
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+factpal <- colorFactor(gg_color_hue(4), plot_tbl$group)
+
+leaflet(plot_tbl %>% st_transform(crs = 4326)) %>% 
+  addTiles() %>%
+  setView(lng = -113.6 ,lat = 43.28, zoom = 9) %>%
+  addWMSTiles(
+    "https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}",
+    layers = "USGSImageryOnly"
+  ) %>%
+  addPolygons(
+    data = crmp_crmo %>% st_transform(crs = 4326), 
+    stroke = TRUE, fillOpacity = .15, smoothFactor = 0.5,
+    color = "white",
+    weight = 2
+  ) %>%
+  addCircleMarkers(
+    data = plot_tbl %>% st_transform(crs = 4326),
+    label = as.character(plot_tbl$frame_num),
+    labelOptions = labelOptions(noHide = T,
+                                direction = "right",
+                                textOnly = TRUE,
+                                offset = c(5, -10),
+                                style = list(
+                                  "color" = "yellow",
+                                  "font-family" = "sanserif",
+                                  "font-style" = "bold",
+                                  "font-size" = "14px"
+                                )),
+    fillColor = ~ factpal(group),
+    fill = TRUE,
+    radius = 3, 
+    fillOpacity = .75,
+    weight = 0,
+    opacity = 1
+  )  %>%
+  addLegend(pal = factpal, values = ~group, opacity = 1)
+
+# color by kipuka
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+plot_tbl <- plot_tbl %>%
+  mutate(kipuka = ifelse(frame_num %in% c("19", "20", "25", "26", "27", "28", "35"), "yes", "no"))
+factpal <- colorFactor(gg_color_hue(2), plot_tbl$kipuka)
+
+leaflet(plot_tbl %>% st_transform(crs = 4326)) %>% 
+  addTiles() %>%
+  setView(lng = -113.6 ,lat = 43.28, zoom = 9) %>%
+  addWMSTiles(
+    "https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}",
+    layers = "USGSImageryOnly"
+  ) %>%
+  addPolygons(
+    data = crmp_crmo %>% st_transform(crs = 4326), 
+    stroke = TRUE, fillOpacity = .15, smoothFactor = 0.5,
+    color = "white",
+    weight = 2
+  ) %>%
+  addCircleMarkers(
+    data = plot_tbl %>% st_transform(crs = 4326),
+    label = as.character(plot_tbl$frame_num),
+    labelOptions = labelOptions(noHide = T,
+                                direction = "right",
+                                textOnly = TRUE,
+                                offset = c(5, -10),
+                                style = list(
+                                  "color" = "yellow",
+                                  "font-family" = "sanserif",
+                                  "font-style" = "bold",
+                                  "font-size" = "14px"
+                                )),
+    fillColor = ~ factpal(kipuka),
+    fill = TRUE,
+    radius = 3, 
+    fillOpacity = .75,
+    weight = 0,
+    opacity = 1
+  ) 
+```
+
+```{r}
+# larger labels for defense
+
+
+# with leaflet
+plot_tbl <- map_plot %>%
+  bind_cols(., st_coordinates(map_plot)[,1],st_coordinates(map_plot)[,2]) %>%
+  rename(lat = "...11", lon = "...12")
+library(leaflet)
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+factpal <- colorFactor(gg_color_hue(4), plot_tbl$group)
+
+leaflet(plot_tbl %>% st_transform(crs = 4326)) %>% 
+  addTiles() %>%
+  setView(lng = -113.6 ,lat = 43.28, zoom = 9) %>%
+  addWMSTiles(
+    "https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}",
+    layers = "USGSImageryOnly"
+  ) %>%
+  addPolygons(
+    data = crmp_crmo %>% st_transform(crs = 4326), 
+    stroke = TRUE, fillOpacity = .15, smoothFactor = 0.5,
+    color = "white",
+    weight = 2
+  ) %>%
+  addCircleMarkers(
+    data = plot_tbl %>% st_transform(crs = 4326),
+    label = as.character(plot_tbl$frame_num),
+    labelOptions = labelOptions(noHide = T,
+                                direction = "right",
+                                textOnly = TRUE,
+                                offset = c(5, -10),
+                                style = list(
+                                  "color" = "yellow",
+                                  "font-family" = "sanserif",
+                                  "font-style" = "bold",
+                                  "font-size" = "14px"
+                                )),
+    fillColor = ~ factpal(group),
+    fill = TRUE,
+    radius = 5, 
+    fillOpacity = .75,
+    weight = 0,
+    opacity = 1
+  )  %>%
+  addLegend(pal = factpal, values = ~group, opacity = 1)
+
+# color by kipuka
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+plot_tbl <- plot_tbl %>%
+  mutate(kipuka = ifelse(frame_num %in% c("19", "20", "25", "26", "27", "28", "35"), "yes", "no"))
+factpal <- colorFactor(gg_color_hue(2), plot_tbl$kipuka)
+
+leaflet(plot_tbl %>% st_transform(crs = 4326)) %>% 
+  addTiles() %>%
+  setView(lng = -113.6 ,lat = 43.28, zoom = 9) %>%
+  addWMSTiles(
+    "https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}",
+    layers = "USGSImageryOnly"
+  ) %>%
+  addPolygons(
+    data = crmp_crmo %>% st_transform(crs = 4326), 
+    stroke = TRUE, fillOpacity = .15, smoothFactor = 0.5,
+    color = "white",
+    weight = 2
+  ) %>%
+  addCircleMarkers(
+    data = plot_tbl %>% st_transform(crs = 4326),
+    label = as.character(plot_tbl$frame_num),
+    labelOptions = labelOptions(noHide = T,
+                                direction = "right",
+                                textOnly = TRUE,
+                                offset = c(5, -10),
+                                style = list(
+                                  "color" = "yellow",
+                                  "font-family" = "sanserif",
+                                  "font-style" = "bold",
+                                  "font-size" = "14px"
+                                )),
+    fillColor = ~ factpal(kipuka),
+    fill = TRUE,
+    radius = 5, 
+    fillOpacity = .75,
+    weight = 0,
+    opacity = 1
+  ) 
+
+```
+
+```{r, eval = F}
+# interpret results
+Y_ <- craters_data %>%
+  mutate(
+    plot = sapply(stringr::str_split(Loc_Name, pattern = "_"), function(x) x[2])
+  ) %>%
+  group_by(plot) %>%
+  # slice_sample(n = 25) %>%
+  ungroup %>%
+  mutate(row_id = as.character(1:n())) %>%
+  dplyr::select(ACHHYM:ZIGSPP, row_id) %>%
+  # convert to binary
+  mutate_if(is.numeric, ~1 * (. != 0)) %>%
+  # remove species that do not occur in at least 5% of sites
+  select_if(function(col) is.character(col) || sum(col) >= (.05 * length(col))) %>%
+  # remove rows that are all 0
+  filter(any_cols(across(1:(ncol(.)-1), ~. == 1))) %>%
+  bind_cols(
+    craters_data %>%
+      mutate(
+        plot = sapply(stringr::str_split(Loc_Name, pattern = "_"), function(x) x[2])
+      ) %>%
+      group_by(plot) %>%
+      # slice_sample(n = 25) %>%
+      ungroup %>%
+      mutate(row_id = as.character(1:n())) %>%
+      slice(row_ndx) %>%
+      select(plot),
+    .
+  )
+
+# frames 1, 2, 8, 11 - group 4
+## elev gradient
+craters_metadata %>% 
+  group_by(Sample_Frame) %>% 
+  summarize(mean_elev = mean(Elevation)) %>% 
+  arrange(mean_elev) %>%
+  print(n = "all")
+
+## dominant species
+### ARTTRID, ERIOSPP, PURTRI
+sort(Y_ %>%
+  filter(plot %in% c("CRMO01", "CRMO02", "CRMO08")) %>%
+  select(-plot, -row_id) %>%
+  as.matrix() %>%
+  colSums() / 165)
+
+
+# frames 19, 20, 26, 27, 32, 35
+## dominant species
+### BROTEC 99, POASEC 66, ALLSPP 50, SISALT 49
+sort(Y_ %>%
+  filter(plot %in% c("CRMO19", "CRMO20", "CRMO26", "CRMO27", "CRMO32", "CRMO35")) %>%
+  select(-plot, -row_id) %>%
+  as.matrix() %>%
+  colSums() / 330)
+
+# frames 25, 28
+## dominant species
+### poasec 76, achspp 68, phlspp 59, agospp 52
+sort(Y_ %>%
+  filter(plot %in% c("CRMO11", "CRMO25", "CRMO28")) %>%
+  select(-plot, -row_id) %>%
+  as.matrix() %>%
+  colSums() / 165)
+
+sort(Y_ %>%
+  filter(plot %in% c("CRMO25", "CRMO28")) %>%
+  select(-plot, -row_id) %>%
+  as.matrix() %>%
+  colSums() / 110)
+
+# everything else
+`%notin%` <- Negate("%in%")
+sort(Y_ %>%
+  filter(plot %notin% c(
+    "CRMO19", "CRMO20", "CRMO26", "CRMO27", "CRMO32", "CRMO35", "CRMO25", "CRMO28", "CRMO01", "CRMO02", "CRMO08", "CRMO11"
+  )) %>%
+  select(-plot, -row_id) %>%
+  as.matrix() %>%
+  colSums() / 858)
+
+names(craters_data_raw)
+```
+
+### Animation for defense
+
+```{r}
+ztbl3d <- z_tbl %>%
+  group_by(obs_id, dim) %>%
+  summarize(
+    mean = mean(trace),
+    clus = getmode(clus_id),
+    clus_prob = mean(clus_id == clus)
+  ) %>%
+  pivot_wider(
+    names_from = dim,
+    values_from = mean, 
+    names_prefix = "z"
+  ) %>%
+  ungroup() %>%
+  mutate(
+    clus_mode = factor(clus)
+  )
+
+
+library(rgl)
+library(magick)
+
+# Let's use the iris dataset
+# iris
+
+# This is ugly
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+colors <- gg_color_hue(4)
+ztbl3d$color <- colors[as.numeric(as.character(ztbl3d$clus_mode))]
+
+# Static chart
+plot3d(
+  ztbl3d$z1, 
+  ztbl3d$z2, 
+  ztbl3d$z3, 
+  col = ztbl3d$color, 
+  type = "s", 
+  radius = 1,
+  xlab = "",
+  ylab = "",
+  zlab = "",
+  aspect = c(3,3,3), 
+  size = 10,
+  main = "", sub = "", ann = FALSE, axes = FALSE
+)
+box3d()
+
+# We can indicate the axis and the rotation velocity
+# play3d( spin3d( axis = c(0, 0, 1), rpm = 20), duration = 10 )
+
+# Save like gif
+movie3d(
+  movie="model",
+  dir = getwd(),
+  spin3d(axis = c(0, 0, 1), rpm = 10),
+  duration = 30, 
+  type = "gif", 
+  clean = TRUE,
+  webshot = F
+)
+```
+
+```{r}
+# mds results
+ztbl3d <- readRDS("rds files/mds_plottbl.rds") %>%
+  rename("z1" = V1, "z2" = V2, "z3" = V3)
+
+# This is ugly
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+colors <- gg_color_hue(4)
+ztbl3d$color <- colors[as.numeric(as.character(ztbl3d$clus_mode))]
+
+# Static chart
+plot3d(
+  ztbl3d$z1, 
+  ztbl3d$z2, 
+  ztbl3d$z3, 
+  col = "black", 
+  type = "s", 
+  radius = .025,
+  xlab = "",
+  ylab = "",
+  zlab = "",
+  aspect = c(3,3,3), 
+  size = 10,
+  main = "", sub = "", ann = FALSE, axes = FALSE
+)
+box3d()
+
+# We can indicate the axis and the rotation velocity
+# play3d( spin3d( axis = c(0, 0, 1), rpm = 20), duration = 10 )
+
+# Save like gif
+movie3d(
+  movie="mds",
+  dir = getwd(),
+  spin3d(axis = c(0, 0, 1), rpm = 5),
+  duration = 10, 
+  type = "gif", 
+  clean = TRUE,
+  webshot = F
+)
+```
+
+### Alluvial diagrams for manuscript
+
+```{r}
+library(ggalluvial)
+tmp <- z_tbl %>%
+  group_by(obs_id, dim) %>%
+  summarize(
+    mean = mean(trace),
+    clus = getmode(clus_id),
+    clus_prob = mean(clus_id == clus)
+  ) %>%
+  pivot_wider(
+    names_from = dim,
+    values_from = mean, 
+    names_prefix = "z"
+  ) %>%
+  ungroup() %>%
+  mutate(
+    clus_mode = factor(clus)
+  ) %>%
+  left_join(
+    ., 
+    long_df %>% 
+      select(ACHSPP:TRADUB) %>% 
+      mutate_if(is.numeric, ~1 * (. != 0)) %>%
+      mutate(obs_id = long_df$frame_num) %>%
+      select(obs_id, everything()) %>%
+      pivot_longer(ACHSPP:TRADUB, names_to = "spp", values_to = "detect") %>%
+      group_by(obs_id, spp, detect) %>%
+      summarize(freq = n())
+  )%>%
+  select(clus_mode, spp:freq) %>%
+  group_by(clus_mode, spp, detect) %>%
+  summarize(freq= sum(freq))
+
+tmp2 <- z_tbl %>%
+  group_by(obs_id, dim) %>%
+  summarize(
+    mean = mean(trace),
+    clus = getmode(clus_id),
+    clus_prob = mean(clus_id == clus)
+  ) %>%
+  pivot_wider(
+    names_from = dim,
+    values_from = mean, 
+    names_prefix = "z"
+  ) %>%
+  ungroup() %>%
+  mutate(
+    clus_mode = factor(clus)
+  ) %>%
+  left_join(
+    ., 
+    long_df %>% 
+      select(ACHSPP:TRADUB) %>% 
+      mutate_if(is.numeric, ~1 * (. != 0)) %>%
+      mutate(obs_id = long_df$frame_num) %>%
+      select(obs_id, everything())
+  ) 
+
+tmp %>%
+  mutate(spp = factor(spp), detect = factor(detect)) %>%
+  filter(spp %in% c("ARTTRID", "BROTEC", "POASEC")) %>%
+  ggplot(aes(axis1 = clus_mode, axis2 = spp, y = freq)) +
+  geom_alluvium(aes(fill = detect)) +
+  geom_stratum(width = 1/12, fill = "grey", color = "white") +
+  geom_label(stat = "stratum", aes(label = after_stat(stratum))) +
+  scale_x_discrete(limits = c("clus_mode", "spp"), expand = c(.05, .05)) +
+  scale_fill_brewer(type = "qual", palette = "Set1") +
+  theme_bw()
+
+tmp %>% 
+  mutate(spp = factor(spp), detect = factor(detect)) %>%
+  filter(spp %in% c("ARTTRID", "BROTEC", "POASEC")) %>%
+  ggplot() + 
+  geom_bar(
+    aes(x = clus_mode, fill = detect, y = freq), stat = "identity", position = "fill"
+  ) +
+  facet_wrap(~spp) +
+  theme_bw() +
+  labs(
+    y = "Proportion of quadrats",
+    x = "Cluster"
+  )
+
+tmp4 <- long_df %>% 
+  select(ACHSPP:TRADUB) %>% 
+  mutate_if(is.numeric, ~1 * (. != 0)) %>%
+  mutate(obs_id = long_df$frame_num) %>%
+  select(
+    obs_id, 
+    # frames 1,2,8
+    ARTTRID, ERIOSPP, PURTRI, BROTEC,
+    # 19, 20, 26, 27, 32, 35
+    POASEC, SISALT, ALLSPP,
+    # 25, 28
+    ACHSPP, LOMSPP
+  ) %>%
+  group_by(obs_id, ARTTRID, BROTEC, POASEC) %>%
+  summarize(freq = n()) %>%
+  left_join(
+    expand.grid(
+      ARTTRID = c(0,1), ERIOSPP = c(0,1), PURTRI = c(0,1), BROTEC = c(0,1), 
+      POASEC = c(0,1), SISALT = c(0,1), ALLSPP = c(0,1),
+      ACHSPP = c(0,1), LOMSPP = c(0,1)
+    ) %>%
+      as_tibble %>%
+      mutate(count = 28) %>%
+      uncount(count) %>%
+      mutate(obs_id = rep(1:28, 2^9)),
+    .
+  ) %>%
+  mutate(freq = ifelse(is.na(freq), 0, freq))
+
+tmp %>%
+  filter(detect == 1) %>%
+  group_by(clus_mode) %>%
+  arrange(clus_mode, desc(freq)) %>%
+  top_n(5) %>%
+  ungroup %>%
+  select(spp) %>% distinct
+
+
+tmp4 %>%
+  left_join(
+    ., 
+    z_tbl %>%
+      group_by(obs_id, dim) %>%
+      summarize(
+        mean = mean(trace),
+        clus = getmode(clus_id),
+        clus_prob = mean(clus_id == clus)
+      ) %>%
+      pivot_wider(
+        names_from = dim,
+        values_from = mean, 
+        names_prefix = "z"
+      ) %>%
+      ungroup() %>%
+      mutate(
+        clus_mode = factor(clus)
+      ) %>%
+      select(obs_id, clus_mode)
+  ) %>%
+  select(obs_id, clus_mode, ARTTRID:LOMSPP, freq) %>%
+  mutate(across(obs_id:LOMSPP, factor)) %>%
+  ggplot(aes(
+    axis1 = clus_mode, axis2 = POASEC, axis4 = ARTTRID, axis3 = BROTEC, axis5 = ALLSPP, axis6 = ACHSPP, axis7 = ERIOSPP, 
+    y = freq
+  )) +
+  geom_alluvium(aes(fill = clus_mode)) +
+  geom_stratum(width = 1/12, fill = "grey", color = "white") +
+  geom_label(stat = "stratum", aes(label = after_stat(stratum))) +
+  scale_x_discrete(limits = c(
+    "cluster",
+    "POASEC","BROTEC", "ARTTRID", "ALLSPP","ACHSPP", "ERIOSPP"
+  ), expand = c(.05, .05)) +
+  scale_fill_brewer(type = "qual", palette = "Dark2") +
+  theme_bw()
+
+# matrix plot
+
+```
+
+
+
+
+# Doubs river
+
+## Data
+
+```{r}
+rm(list = ls())
+
+nimble_summary <- function(fit, warmup = nrow(fit[[1]])/2, thin = 1){
+  # convert to coda for normal summary
+  fit_warmup <- lapply(fit, function(x) x[(warmup+1):nrow(x),])
+  coda_samples <- as.mcmc.list(lapply(fit_warmup, function(x) as.mcmc(
+    x, start = warmup+1, end = nrow(fit), thin = thin
+  )))
+  
+  sum <- summary(coda_samples)
+  params <- dimnames(sum$statistics)[[1]]
+  tmp_sum <- cbind(sum$statistics, sum$quantiles)
+  
+  # get r hat / n_eff
+  mat <- matrix(NA, nrow = nrow(tmp_sum), ncol = 3)
+  colnames(mat) <- c("Rhat", "ess_bulk", "ess_tail")
+  for(i in 1:nrow(tmp_sum)){
+    tmp <- sapply(fit, function(x) x[,i])
+    mat[i,] <- c(Rhat(tmp), ess_bulk(tmp), ess_tail(tmp))
+  }
+  
+  # out 
+  out <- cbind(tmp_sum, mat)
+  return(out)
+}
+
+fit_model <- function(seed = 1, code, data, constants, inits, niter, nchains, thin = 1){
+  library(nimble)
+  
+  # R model
+  model <- nimbleModel(code, constants, data)
+  
+  # C model
+  model_c <- compileNimble(model)
+  
+  # R mcmc
+  model_conf <- configureMCMC(model)
+  model_conf$addMonitors(c("clus_id", "z"))
+
+  # R mcmc
+  mcmc <- buildMCMC(model_conf)
+  
+  # C mcmc
+  mcmc_c <- compileNimble(mcmc, project = model_c)
+  
+  # run model
+  out <- runMCMC(
+    mcmc_c, 
+    niter = niter, 
+    nchains = nchains, 
+    thin = thin, 
+    init = inits,
+    setSeed = seed
+  )
+  
+  # out
+  return(out)
+}
+
+ord_ls <- function(mcmc, d = 2, seed = NULL, force_K = NULL){
+  # optional seed
+  if(!is.null(seed)) set.seed(seed)
+  
+  # housekeeping
+  mu <- lapply(mcmc, function(x) x[,which(grepl("mu", colnames(x)))])
+  clus_id <- lapply(mcmc, function(x) x[,which(grepl("clus_id", colnames(x)))])
+  other_ndx <- c(1:length(colnames(mcmc[[1]])))[-c(
+    sort(c(
+      which(grepl("clus_id", colnames(mcmc[[1]]))), 
+      which(grepl("mu", colnames(mcmc[[1]])))
+    ))
+  )]
+  other <- lapply(mcmc, function(x) x[,other_ndx])
+  
+  mu_mcmc <- do.call("rbind", mu)
+  clus_mcmc <- do.call("rbind", clus_id)
+  other_mcmc <- do.call("rbind", other)
+  
+  # helper function
+  getmode <- function(v) {
+    uniqv <- unique(v)
+    uniqv[which.max(tabulate(match(v, uniqv)))]
+  }
+  
+  # step 1 - determine number of non-empty cluster for each iteration
+  n_clus_mcmc <- apply(clus_mcmc, 1, function(x) length(unique(x)))
+  
+  # step 2 - estimate the mode
+  if(is.null(force_K)){
+    n_clus_mode <- getmode(n_clus_mcmc)
+  } else{
+    n_clus_mode <- force_K
+  }
+  
+  # step 3 - filter to iterations with n_clus_mcmc = n_clus_mode
+  ## filter first
+  which_equal_mode_index <- which(n_clus_mcmc == n_clus_mode)
+  mu_mcmc_filtered <- mu_mcmc[which_equal_mode_index, ]
+  clus_mcmc_filtered <- clus_mcmc[which_equal_mode_index, ]
+  other_mcmc_filtered <- other_mcmc[which_equal_mode_index, ]
+  
+  ## remove empty clusters - loop
+  mu_reduced <- matrix(NA, nrow = nrow(mu_mcmc_filtered), ncol = n_clus_mode * d)
+  clus_reduced <- array(NA, dim = dim(clus_mcmc_filtered))
+  for(i in 1:length(which_equal_mode_index)){
+    clus_id_i <- sort(unique(clus_mcmc_filtered[i, ]))
+    col_ndx <- which(
+      stringr::str_sub(
+        colnames(mu_mcmc_filtered), 
+        start = stringr::str_locate(colnames(mu_mcmc_filtered), pattern = "\\[")[,1] + 1,
+        end = stringr::str_locate(colnames(mu_mcmc_filtered), pattern = "\\,")[,1] - 1
+      ) %in% clus_id_i
+    )
+    
+    mu_reduced[i, ] <- mu_mcmc_filtered[i,col_ndx]
+    colnames(mu_reduced) <- paste0("mu[", rep(1:n_clus_mode, d), ", ", rep(1:d, each = n_clus_mode), "]")
+    clus_reduced[i, ] <- as.numeric(factor(clus_mcmc_filtered[i,]))
+    colnames(clus_reduced) <- colnames(clus_mcmc_filtered)
+  }
+  
+  # step 4 - create data matrix, cluster with k-means
+  data_matrix <- matrix(
+    c(mu_reduced), 
+    nrow = nrow(mu_reduced) * n_clus_mode,
+    ncol = d
+  )
+  k_means <- kmeans(data_matrix, centers = n_clus_mode)
+  rho <- matrix(k_means$cluster, nrow = nrow(mu_reduced), ncol = n_clus_mode)
+  
+  # step 5 - check whether rho_i is a permutation of 1:n_clus_mode
+  keep_ndx <- which(apply(rho, 1, function(x) all(sort(x) == 1:n_clus_mode)))
+  mu_reduced <- mu_reduced[keep_ndx,]
+  clus_reduced <- clus_reduced[keep_ndx,]
+  other_reduced <- other_mcmc_filtered[keep_ndx, ]
+  rho <- rho[keep_ndx,] %>% as.matrix(., ncol = n_clus_mode)
+  
+  # step 6 - relabel according to rho
+  ## relabel mus first - works, but slow
+  mu_relabeled <- array(NA, dim = dim(mu_reduced))
+  colnames(mu_relabeled) <- colnames(mu_reduced)
+  for(i in 1:nrow(mu_relabeled)){
+    for(j in 1:ncol(mu_relabeled)){
+      # get group id
+      group_id <- stringr::str_sub(
+        colnames(mu_reduced)[j], 
+        start = stringr::str_locate(colnames(mu_reduced)[j], pattern = "\\[")[,1] + 1,
+        end = stringr::str_locate(colnames(mu_reduced)[j], pattern = "\\,")[,1] - 1
+      ) %>% as.numeric()
+      
+      dim_id <- stringr::str_sub(
+        colnames(mu_reduced)[j], 
+        start = stringr::str_locate(colnames(mu_reduced)[j], pattern = "\\,")[,1] + 1,
+        end = stringr::str_locate(colnames(mu_reduced)[j], pattern = "\\]")[,1] - 1
+      ) %>% as.numeric()
+      
+      # replace with proper value according to rho
+      rho_i <- rho[i, ]
+      mu_relabeled[i,j] <- mu_reduced[i, which(
+        colnames(mu_reduced) == paste0("mu[", which(rho_i == group_id), ", ", dim_id, "]")
+      )]
+    }
+  }
+  
+  ## relabel clus_id's
+  clus_relabeled <- array(NA, dim = dim(clus_reduced))
+  colnames(clus_relabeled) <- colnames(clus_reduced)
+  for(i in 1:nrow(clus_relabeled)){
+    rho_i <- rho[i,]
+    clus_id_i <- clus_reduced[i,]
+    clus_relabeled[i,] <- sapply(clus_id_i, function(x) rho_i[x])
+  }
+  
+  out <- list(
+    mu = mu_relabeled, 
+    clus_id = clus_relabeled, 
+    other = other_reduced,
+    which_iter = which_equal_mode_index[keep_ndx]
+  )
+  
+  return(out)
+}
+```
+
+```{r, eval = F}
+# for geo referenced plot
+library(codep)
+data(Doubs, package = "codep")
+doubs_plot <- Doubs.geo %>%
+  as_tibble %>%
+  mutate(site_num = 1:n()) %>%
+  st_as_sf(coords = c("Lon", "Lat"), crs = 4326) 
+
+doubs_plot %>%
+  ggplot() +
+  geom_sf() +
+  theme_bw()
+
+# leaflet
+library(leaflet)
+leaflet(doubs_plot %>% st_transform(crs = 4326)) %>% 
+  addTiles() %>%
+  setView(lng = 6.359, lat = 47.13, zoom = 9) %>%
+  addWMSTiles(
+    "https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}",
+    layers = "USGSImageryOnly"
+  ) %>%
+  addCircleMarkers(
+    data = doubs_plot %>% st_transform(crs = 4326),
+    label = as.character(doubs_plot$site_num),
+    labelOptions = labelOptions(noHide = T,
+                                direction = "right",
+                                textOnly = TRUE,
+                                offset = c(5, -10),
+                                style = list(
+                                  "color" = "red",
+                                  "font-family" = "sanserif",
+                                  "font-style" = "bold",
+                                  "font-size" = "16px"
+                                )),
+    fill = TRUE,
+    radius = 3, 
+    fillOpacity = .75,
+    weight = 0,
+    opacity = 1
+  ) 
+```
+
+## Prior on number of groups
+
+```{r}
+library(gmp)
+# probability mass function from Antoniak (1974)
+antoniak <- function(k, alpha, n){
+  alpha <- gmp::as.bigq(as.character(MASS::fractions(alpha)))
+  
+  # A.n first
+  A.n <- function(x, n){
+    sum(abs(gmp::Stirling1.all(n)) * x^(1:n))
+  }
+  
+  # compute mass
+  out <- as.numeric((abs(gmp::Stirling1(n, k)) * alpha^k) / A.n(alpha, n))
+  return(out)
+}
+plot(sapply(1:10, function(x) antoniak(x, 1/2, 29)), main = "Prior mass on number of groups for n = 29, alpha = 1/2")
+```
+
+## Model, d = 2
+
+```{r}
+# data
+library(ade4)
+data(doubs)
+Y <- doubs$fish[-8,] %>% as.matrix
+Y[which(Y>0)] <- 1
+
+# model based %>% 
+code <- nimbleCode({
+  # priors
+  ## site effects
+  for(site in 1:nsites){
+    alpha[site] ~ dnorm(0, 1)
+  }
+  
+  ## species effects
+  for(species in 1:nspecies){
+    beta[species] ~ dnorm(0, 1)
+  }
+  
+  ## z priors
+  ### Dirichlet process mixture parameters
+  clus_id[1:nsites] ~ dCRP(dp_con, size = nsites)
+  dp_con ~ dgamma(1, 2)
+  
+  ### table parameters - fix covariance as identity
+  for(i in 1:max_clus){
+    mu[i, 1:d] ~ dmnorm(mu0[1:d], Lambda0[1:d, 1:d])
+  }
+  # for(dim_ord in 1:d){
+  #   mu[1, dim_ord] <- -sum(mu[2:max_clus,dim_ord])
+  # }
+  
+  for(site in 1:nsites){
+    # identity matrix for constraint
+    z[site, 1:d] ~ dmnorm(mu[clus_id[site], 1:d], cov = S[1:d, 1:d])
+  }
+  
+  # theta prior
+  ## upper triangle = 0
+  for(row in 1:(d-1)){
+    for(col in (row+1):d){
+      theta[row, col] <- 0
+    }
+  }
+  
+  ## diag > 0
+  for(diag_element in 1:d){
+    theta[diag_element, diag_element] ~ T(dnorm(0, sd = 1), 0, Inf)
+  }
+  
+  ## lower diag of first d rows
+  for(row in 2:d){
+    for(col in 1:(row-1)){
+      theta[row, col] ~ dnorm(0, sd = 1)
+    }
+  }
+  
+  ## all other elements
+  for(row in (d+1):nspecies){
+    for(col in 1:d){
+      theta[row, col] ~ dnorm(0, sd = 1)
+    }
+  }
+  
+  # likelihood 
+  for(site in 1:nsites){
+    for(species in 1:nspecies){
+      logit(pi[site, species]) <- alpha[site] + beta[species] + inprod(z[site,1:d], theta[species, 1:d])
+      Y[site, species] ~ dpois(pi[site, species])
+    }
+  }
+})
+init_func <- function(){
+  d <- 2
+  nrow <- 29
+  nspecies <- 27
+  max_clus <- 29
+  
+  theta_init <- matrix(rnorm(d * nspecies), nspecies, d)
+  diag(theta_init) <- abs(rnorm(d))
+  theta_init[upper.tri(theta_init)] <- 0
+  
+  list(
+    alpha = rnorm(nrow),
+    beta = rnorm(nspecies),
+    z = matrix(rnorm(nrow * d), nrow, d),
+    theta = theta_init,
+    dp_con = 1,
+    clus_id = sample(c(1, 2), size = nrow, replace = T),
+    mu = matrix(rnorm(d*max_clus), max_clus, d)
+  )
+}
+
+this_cluster <- makeCluster(3)
+fit <- parLapply(
+  cl = this_cluster,
+  X = 1001:1003,
+  fun = fit_model,
+  code = code,
+  data = list(
+    Y = Y,
+    S = diag(2),
+    mu0 = rep(0, 2),
+    Lambda0 = diag(2)
+  ),
+  constants = list(
+    nsites = nrow(Y),
+    nspecies = ncol(Y),
+    d = 2,
+    max_clus = 29
+  ),
+  inits = init_func,
+  niter = 100000,
+  nchains = 1,
+  thin = 1
+)
+stopCluster(this_cluster)
+saveRDS(fit, file = "rds files/doubs_bin_2d.rds")
+```
+
+## Model summaries
+
+### K = 2 (modal)
+
+```{r}
+fit <- readRDS("rds files/manuscript models/doubs_bin_2d.rds")
+fit <- lapply(fit, function(x) x[(nrow(x)/2 + 1):nrow(x), ])
+samples_relabeled <- ord_ls(mcmc = fit[c(1:3)], d = 2, seed = 10182021)
+
+mu_tbl <- tibble(
+  trace = c(samples_relabeled$mu),
+  param = rep(colnames(samples_relabeled$mu), each = nrow(samples_relabeled$mu)),
+  iter = rep(1:nrow(samples_relabeled$mu), length(colnames(samples_relabeled$mu))),
+  chain = 1,
+  clus_id = stringr::str_sub(param, 4, 4), 
+  dim = stringr::str_sub(param, 7, 7)
+)
+
+mu_tbl %>%
+  filter(dim == 1) %>%
+  ggplot(aes(x = iter, y = trace, col = clus_id)) +
+  # facet_wrap(~ chain, labeller = label_both) +
+  geom_line() +
+  theme_bw() +
+  labs(
+    title = bquote("Traceplot for" ~ mu[1] * ", adjusted for label switching")
+  )
+
+mu_tbl %>%
+  filter(dim == 2) %>%
+  ggplot(aes(x = iter, y = trace, col = clus_id)) +
+  # facet_wrap(~ chain, labeller = label_both) +
+  geom_line() +
+  theme_bw() +
+  labs(
+    title = bquote("Traceplot for" ~ mu[2] * ", adjusted for label switching")
+  )
+```
+
+```{r}
+getmode <- function(v) {
+  uniqv <- unique(v)
+  uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+z_mcmc <- samples_relabeled$other[,which(grepl("z", colnames(samples_relabeled$other)))]
+z_tbl <- left_join(
+  tibble(
+    trace = c(z_mcmc),
+    param = rep(colnames(z_mcmc), each = nrow(z_mcmc)),
+    iter = rep(1:nrow(z_mcmc), length(colnames(z_mcmc))),
+    obs_id = stringr::str_sub(
+      param, 
+      start = stringr::str_locate(param, pattern = "\\[")[,1] + 1,
+      end = stringr::str_locate(param, pattern = "\\,")[,1] - 1
+    ) %>% as.numeric(),
+    dim = stringr::str_sub(
+      param, 
+      start = stringr::str_locate(param, pattern = "\\,")[,1] + 1,
+      end = stringr::str_locate(param, pattern = "\\]")[,1] - 1
+    ) %>% as.numeric()
+  ),
+  tibble(
+    clus_id = c(samples_relabeled$clus_id),
+    iter = rep(1:nrow(samples_relabeled$clus_id), length(colnames(samples_relabeled$clus_id))),
+    obs_id = rep(1:ncol(samples_relabeled$clus_id), each = nrow(samples_relabeled$clus_id))
+  ),
+  by = c("iter", "obs_id")
+)
+
+# posterior probabilities on numbers of groups
+clus_id <- lapply(fit, function(x) x[,which(grepl("clus_id", colnames(x)))])
+clus_id_all <- do.call("rbind", clus_id)
+ngroups_mcmc <- apply(clus_id_all, 1, function(x) length(unique(x)))
+round(table(ngroups_mcmc) / length(ngroups_mcmc), 3)
+
+z_tbl %>%
+  group_by(obs_id, dim) %>%
+  summarize(
+    mean = mean(trace),
+    clus = getmode(clus_id),
+    clus_prob = mean(clus_id == clus)
+  ) %>%
+  pivot_wider(
+    names_from = dim,
+    values_from = mean, 
+    names_prefix = "z"
+  ) %>%
+  ungroup() %>%
+  mutate(
+    cluster = factor(clus)
+  ) %>% 
+  mutate(
+    obs_id = ifelse(obs_id > 7, obs_id + 1, obs_id)
+  ) %>%
+  ggplot() +
+  geom_text(aes(x = z1, y = z2, col = cluster, label = obs_id)) +
+  theme_bw() +
+  # guides(col = "none") +
+  labs(x = bquote(z[1]), y = bquote(z[2]))
+```
+
+```{r}
+distance <- function(x, method = "euclidean", func = func){
+  if(method != "custom") {
+    dist.vec <- parallelDist::parDist(x, method = method)
+  } else{
+    dist.vec <- parallelDist::parDist(x, method = method, func = func)
+  }
+  dist <- as.matrix(dist.vec)
+  
+  if(method == "custom") {
+    dist <- dist / ncol(x)
+    diag(dist) <- 1
+  }
+  
+  return(dist)
+}
+pairwise_groups <- function(clus_id) {
+  # house keeping
+  nobs <- ncol(clus_id)
+  nmcmc <- nrow(clus_id)
+  
+  same_group <- matrix(0, nobs, nobs)
+  for(iter in 1:nmcmc){
+    tmp <- as.matrix(distance(matrix(clus_id[iter,], ncol = 1)))
+    tmp[tmp > 0] <- 1
+    tmp <- -(tmp - 1)
+    same_group <- same_group + tmp
+  }
+   return(same_group/nmcmc)
+}
+
+# example
+ex_matrix <- t(sapply(1:100, function(x) sample(1:3, size = 10, replace = T)))
+pairwise_groups(ex_matrix)
+matchingFuncPtr <- RcppXPtrUtils::cppXPtr(
+'double customDist(const arma::mat &A, const arma::mat &B) {
+  return arma::accu(A == B);
+}', depends = c("RcppArmadillo"))
+distance(t(ex_matrix), method = "custom", func = matchingFuncPtr)
+
+# data
+clus_id <- samples_relabeled$clus_id
+test2 <- distance(t(clus_id), method = "custom", func = matchingFuncPtr)
+
+# by quadrats, but labeled by site
+test <- test2
+test[upper.tri(test)] <- NA
+fields::image.plot(
+  1:nrow(test), 
+  1:ncol(test), 
+  test,
+  col = gray.colors(n=128,start=1,end=0), 
+  breaks = seq(0,1,length=129),
+  axes = F,
+  xlab = "Site number",
+  ylab = "Site number"
+)
+box()
+axis(
+  1, 
+  at = 1:29, 
+  labels = c(1:7, 9:30),
+  cex.axis = .77
+)
+axis(
+  2, 
+  at = 1:29, 
+  labels = c(1:7, 9:30),
+  cex.axis = .77,
+  las = 1
+)
+plot_crop("doubs_pairwise.png")
+```
+
+### K = 3
+
+```{r}
+fit <- readRDS("rds files/doubs_bin_2d.rds")
+fit <- lapply(fit, function(x) x[(nrow(x)/2 + 1):nrow(x), ])
+samples_relabeled <- ord_ls(mcmc = fit[c(1:3)], d = 2, seed = 10182021, force_K = 3)
+
+mu_tbl <- tibble(
+  trace = c(samples_relabeled$mu),
+  param = rep(colnames(samples_relabeled$mu), each = nrow(samples_relabeled$mu)),
+  iter = rep(1:nrow(samples_relabeled$mu), length(colnames(samples_relabeled$mu))),
+  chain = 1,
+  clus_id = stringr::str_sub(param, 4, 4), 
+  dim = stringr::str_sub(param, 7, 7)
+)
+
+mu_tbl %>%
+  filter(dim == 1) %>%
+  ggplot(aes(x = iter, y = trace, col = clus_id)) +
+  # facet_wrap(~ chain, labeller = label_both) +
+  geom_line() +
+  theme_bw() +
+  labs(
+    title = bquote("Traceplot for" ~ mu[1] * ", adjusted for label switching")
+  )
+
+mu_tbl %>%
+  filter(dim == 2) %>%
+  ggplot(aes(x = iter, y = trace, col = clus_id)) +
+  # facet_wrap(~ chain, labeller = label_both) +
+  geom_line() +
+  theme_bw() +
+  labs(
+    title = bquote("Traceplot for" ~ mu[2] * ", adjusted for label switching")
+  )
+```
+
+```{r}
+getmode <- function(v) {
+  uniqv <- unique(v)
+  uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+z_mcmc <- samples_relabeled$other[,which(grepl("z", colnames(samples_relabeled$other)))]
+z_tbl <- left_join(
+  tibble(
+    trace = c(z_mcmc),
+    param = rep(colnames(z_mcmc), each = nrow(z_mcmc)),
+    iter = rep(1:nrow(z_mcmc), length(colnames(z_mcmc))),
+    obs_id = stringr::str_sub(
+      param, 
+      start = stringr::str_locate(param, pattern = "\\[")[,1] + 1,
+      end = stringr::str_locate(param, pattern = "\\,")[,1] - 1
+    ) %>% as.numeric(),
+    dim = stringr::str_sub(
+      param, 
+      start = stringr::str_locate(param, pattern = "\\,")[,1] + 1,
+      end = stringr::str_locate(param, pattern = "\\]")[,1] - 1
+    ) %>% as.numeric()
+  ),
+  tibble(
+    clus_id = c(samples_relabeled$clus_id),
+    iter = rep(1:nrow(samples_relabeled$clus_id), length(colnames(samples_relabeled$clus_id))),
+    obs_id = rep(1:ncol(samples_relabeled$clus_id), each = nrow(samples_relabeled$clus_id))
+  ),
+  by = c("iter", "obs_id")
+)
+
+# posterior probabilities on numbers of groups
+# clus_id <- lapply(fit, function(x) x[,which(grepl("clus_id", colnames(x)))])
+# clus_id_all <- do.call("rbind", clus_id)
+# ngroups_mcmc <- apply(clus_id_all, 1, function(x) length(unique(x)))
+# round(table(ngroups_mcmc) / length(ngroups_mcmc), 3)
+
+z_tbl %>%
+  group_by(obs_id, dim) %>%
+  summarize(
+    mean = mean(trace),
+    clus = getmode(clus_id),
+    clus_prob = mean(clus_id == clus)
+  ) %>%
+  pivot_wider(
+    names_from = dim,
+    values_from = mean, 
+    names_prefix = "z"
+  ) %>%
+  ungroup() %>%
+  mutate(
+    clus_mode = factor(clus)
+  ) %>% 
+  mutate(
+    obs_id = ifelse(obs_id > 7, obs_id + 1, obs_id)
+  ) %>%
+  ggplot() +
+  geom_text(aes(x = z1, y = z2, col = clus_mode, label = obs_id)) +
+  theme_bw() +
+  guides(col = "none") +
+  labs(x = bquote(z[1]), y = bquote(z[2]))
+```
+
+```{r}
+distance <- function(x, method = "euclidean", func = func){
+  if(method != "custom") {
+    dist.vec <- parallelDist::parDist(x, method = method)
+  } else{
+    dist.vec <- parallelDist::parDist(x, method = method, func = func)
+  }
+  dist <- as.matrix(dist.vec)
+  
+  if(method == "custom") {
+    dist <- dist / ncol(x)
+    diag(dist) <- 1
+  }
+  
+  return(dist)
+}
+pairwise_groups <- function(clus_id) {
+  # house keeping
+  nobs <- ncol(clus_id)
+  nmcmc <- nrow(clus_id)
+  
+  same_group <- matrix(0, nobs, nobs)
+  for(iter in 1:nmcmc){
+    tmp <- as.matrix(distance(matrix(clus_id[iter,], ncol = 1)))
+    tmp[tmp > 0] <- 1
+    tmp <- -(tmp - 1)
+    same_group <- same_group + tmp
+  }
+   return(same_group/nmcmc)
+}
+
+# example
+ex_matrix <- t(sapply(1:100, function(x) sample(1:3, size = 10, replace = T)))
+pairwise_groups(ex_matrix)
+matchingFuncPtr <- RcppXPtrUtils::cppXPtr(
+'double customDist(const arma::mat &A, const arma::mat &B) {
+  return arma::accu(A == B);
+}', depends = c("RcppArmadillo"))
+distance(t(ex_matrix), method = "custom", func = matchingFuncPtr)
+
+# data
+clus_id <- samples_relabeled$clus_id
+test2 <- distance(t(clus_id), method = "custom", func = matchingFuncPtr)
+
+# by quadrats, but labeled by site
+test <- test2
+test[upper.tri(test)] <- NA
+fields::image.plot(
+  1:nrow(test), 
+  1:ncol(test), 
+  test,
+  col = gray.colors(n=128,start=1,end=0), 
+  breaks = seq(0,1,length=129),
+  axes = F,
+  xlab = "Site number",
+  ylab = "Site number"
+)
+box()
+axis(
+  1, 
+  at = 1:29, 
+  labels = c(1:7, 9:30),
+  cex.axis = .75
+)
+axis(
+  2, 
+  at = 1:29, 
+  labels = c(1:7, 9:30),
+  cex.axis = .75
+)
+```
+
+
