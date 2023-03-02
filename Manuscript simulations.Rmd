@@ -53,7 +53,7 @@ rm(packs)
 # convenience
 `%notin%` <- Negate("%in%")
 options(mc.cores = parallel::detectCores())
-source("simulations/helpers.R")
+source("simulations_helpers.R")
 ```
 
 ```{r}
@@ -501,7 +501,7 @@ compas_data[[4]] <- lapply(
     )
   }
 )
-saveRDS(compas_data, file = "simulations/compas_data.rds")
+saveRDS(compas_data, file = "simulations_compas_data.rds")
 ```
 
 ```{r}
