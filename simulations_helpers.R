@@ -271,9 +271,18 @@ coral_code <- nimbleCode({
   pi[1:K] ~ ddirch(ones[1:K])
   
   ### table parameters - fix covariance as identity
-  for(i in 1:K){
-    mu[i, 1:d] ~ dmnorm(mu0[1:d], Lambda0[1:d, 1:d])
+  for(dim in 1:d){
+    mu[1, dim] = -sum(mu[2:K, dim])
   }
+  for(clus in 2:K){
+    for(dim in 1:d){
+      mu[clus, dim] ~ dnorm(0, var = 10)
+    }
+  }
+  # for(i in 1:max_clus){
+  #   mu[i, 1:d] ~ dmnorm(mu0[1:d], Lambda0[1:d, 1:d])
+  # }
+  
   
   for(site in 1:nsites){
     # identity matrix for constraint
@@ -370,13 +379,15 @@ coral_code_k1 <- nimbleCode({
     }
   }
 })
-init_func <- function(mat, d = 2){
+init_func <- function(mat, d = 2, max_clus){
   nrow <- nrow(mat)
   nspecies <- ncol(mat)
   max_clus <- nrow
   theta_init <- matrix(rnorm(d * nspecies), nspecies, d)
   diag(theta_init) <- abs(rnorm(d))
   theta_init[upper.tri(theta_init)] <- 0
+  mu <- matrix(rnorm(d*max_clus), max_clus, d)
+  if(max_clus != 1) mu[1,] <- -colSums(mu[-1,])
   
   list(
     alpha = rnorm(nrow),
@@ -385,7 +396,7 @@ init_func <- function(mat, d = 2){
     theta = theta_init,
     dp_con = 1,
     clus_id = sample(c(1, 2), size = nrow, replace = T),
-    mu = matrix(rnorm(d*max_clus), max_clus, d),
+    mu = mu,
     phi = runif(1)
   )
 }
@@ -400,7 +411,7 @@ fit_model <- function(seed = 1, code, data, constants, inits, niter, nchains, th
   
   # R mcmc
   model_conf <- configureMCMC(model)
-  model_conf$addMonitors(c("clus_id", "z"))
+  # model_conf$addMonitors(c("clus_id", "z"))
   
   # R mcmc
   mcmc <- buildMCMC(model_conf)
@@ -601,7 +612,7 @@ summarize_dpord <- function(fit, seed = 1){
     })
   }
   ndx <- sapply(out, function(x) x[1:min(sapply(out, length))])
-  if(any(ndx < 100)) return(NA)
+  if(any(sapply(out, length) < 100)) return(NA)
   ndx <- ndx[-c(1, nrow(ndx)),]
   all_samples <- cbind(samples_rl$mu, samples_rl$other)
   all_samples <- all_samples[,-which(colnames(all_samples) == "theta[1, 2]")]
@@ -670,7 +681,7 @@ summarize_coral <- function(fit, seed = 1, k){
     })
   }
   ndx <- sapply(out, function(x) x[1:min(sapply(out, length))])
-  if(any(ndx < 100)) return(NA)
+  if(any(sapply(out, length) < 100)) return(NA)
   ndx <- ndx[-c(1, nrow(ndx)),]
   all_samples <- cbind(samples_rl$mu, samples_rl$other)
   all_samples <- all_samples[,-which(colnames(all_samples) == "theta[1, 2]")]
@@ -812,16 +823,16 @@ get_waic_k1 <- function(Y, coral_fit, verbose = F){
 }
 
 # functions for simulation
-# mat = compas_data[[1]][[1]]$Y
-# true_coords = compas_data[[1]][[1]]$true_coords
-# k = 2
-# sim = 1
-# niter = 10000
-# nburnin = 5000
-# thin = 5
-# nchains = 3
-# max_clus = 3
-# max_attempts = 2
+mat = compas_data[[1]][[1]]$Y
+true_coords = compas_data[[1]][[1]]$true_coords
+k = 2
+sim = 1
+niter = 50000
+nburnin = 25000
+thin = 5
+nchains = 3
+max_clus = 3
+max_attempts = 2
 one_sim <- function(mat, true_coords, k, sim, niter = 75000, nchains = 3, nburnin = 25000, thin = 5, max_clus = 8, max_attempts = 10){
   # function to run one iteration of simulation
   out <- list()
@@ -837,6 +848,7 @@ one_sim <- function(mat, true_coords, k, sim, niter = 75000, nchains = 3, nburni
   nattempts <- 1
   message("Fitting dpord")
   while(dpord_rhat > 1.1 & nattempts < max_attempts){
+    message(paste0("Attempt "), nattempts)
     dpord_start <- Sys.time()
     this_cluster <- makeCluster(nchains)
     dpord_fit <- parLapply(
@@ -856,7 +868,7 @@ one_sim <- function(mat, true_coords, k, sim, niter = 75000, nchains = 3, nburni
         mu0 = rep(0, 2),
         Lambda0 = diag(2)
       ),
-      inits = init_func(mat, d = 2),
+      inits = init_func(mat, d = 2, max_clus),
       niter = niter,
       burnin = nburnin,
       nchains = 1,
@@ -865,19 +877,19 @@ one_sim <- function(mat, true_coords, k, sim, niter = 75000, nchains = 3, nburni
     stopCluster(this_cluster)
     dpord_end <- Sys.time()
     dpord_sum <- summarize_dpord(dpord_fit)
-    if(is.na(dpord_sum)){
+    if(length(dpord_sum) == 1){
       dpord_rhat <- 999
     } else{
       dpord_sum$runtime <- as.numeric(dpord_end - dpord_start, units = "secs")
       dpord_rhat <- max(dpord_sum$conv$rhat, na.rm = T)
     }
+    saveRDS(dpord_fit, paste0( "simulations/models_raw/dpord_fit_", k, "_", sim, ".rds"))
+    saveRDS(dpord_sum, paste0("simulations/summaries/dpord_sum_", k, "_", sim, ".rds"))
     nattempts <- nattempts + 1
   }
-  saveRDS(dpord_fit, paste0( "simulations/models_raw/dpord_fit_", k, "_", sim, ".rds"))
-  saveRDS(dpord_sum, paste0("simulations/summaries/dpord_sum_", k, "_", sim, ".rds"))
-  
+
   # summaries
-  if(is.na(dpord_sum)){
+  if(length(dpord_sum) == 1){
     procrust[1,1] <- NA
     procrust[1,2] <- NA
     pairwise_clus_prop[1,1] <- NA
@@ -911,6 +923,7 @@ one_sim <- function(mat, true_coords, k, sim, niter = 75000, nchains = 3, nburni
       coral_rhat <- 2
       nattempts <- 1
       while(coral_rhat > 1.1 & nattempts < max_attempts){
+        message(paste0("Attempt "), nattempts)
         coral_start <- Sys.time()
         this_cluster <- makeCluster(nchains)
         coral_fit <- parLapply(
@@ -928,7 +941,7 @@ one_sim <- function(mat, true_coords, k, sim, niter = 75000, nchains = 3, nburni
             S = diag(2),
             mu0 = rep(0, 2)
           ),
-          inits = init_func(mat, d = 2),
+          inits = init_func(mat, d = 2, max_clus = 1),
           niter = niter,
           burnin = nburnin,
           nchains = 1,
@@ -959,6 +972,7 @@ one_sim <- function(mat, true_coords, k, sim, niter = 75000, nchains = 3, nburni
       coral_rhat <- 2
       nattempts <- 1
       while(coral_rhat > 1.1 & nattempts < max_attempts){
+        message(paste0("Attempt "), nattempts)
         coral_start <- Sys.time()
         this_cluster <- makeCluster(nchains)
         coral_fit <- parLapply(
@@ -980,7 +994,7 @@ one_sim <- function(mat, true_coords, k, sim, niter = 75000, nchains = 3, nburni
             Lambda0 = diag(2),
             ones = rep(1, ndx)
           ),
-          inits = init_func(mat, d = 2),
+          inits = init_func(mat, d = 2, ndx),
           niter = niter,
           burnin = nburnin,
           nchains = 1,
@@ -991,7 +1005,7 @@ one_sim <- function(mat, true_coords, k, sim, niter = 75000, nchains = 3, nburni
         
         # separate waic and samples
         coral_sum <- summarize_coral(coral_fit, k = ndx)
-        if(is.na(coral_sum)){
+        if(length(coral_sum) == 1){
           waic[ndx,1] <- NA
           runtimes[ndx,1] <- as.numeric(coral_end - coral_start, units = "secs")
         } else{

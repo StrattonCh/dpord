@@ -56,10 +56,6 @@ options(mc.cores = parallel::detectCores())
 source("simulations_helpers.R")
 ```
 
-```{r}
-
-```
-
 # Introduction
 
 Simulations using COMPAS, similar to Hui.
