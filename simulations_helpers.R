@@ -915,7 +915,7 @@ one_sim <- function(mat, true_coords, k, sim, niter = 75000, nchains = 3, nburni
         this_cluster <- makeCluster(nchains)
         coral_fit <- parLapply(
           cl = this_cluster,
-          X = 1:nchains + ndx*100,
+          X = 1:nchains + nattempts*100,
           fun = fit_model_k1,
           code = coral_code_k1,
           data = list(
@@ -963,7 +963,7 @@ one_sim <- function(mat, true_coords, k, sim, niter = 75000, nchains = 3, nburni
         this_cluster <- makeCluster(nchains)
         coral_fit <- parLapply(
           cl = this_cluster,
-          X = 1:nchains + ndx*100,
+          X = 1:nchains + nattempts*100,
           fun = fit_model,
           code = coral_code,
           data = list(
