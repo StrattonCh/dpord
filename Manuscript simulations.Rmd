@@ -340,7 +340,7 @@ z_tbl %>%
 
 ```{r}
 rm(list = ls())
-source("simulations/helpers.R")
+source("simulations_helpers.R")
 source("coral.R")
 ```
 
@@ -505,23 +505,11 @@ saveRDS(compas_data, file = "simulations/compas_data.rds")
 ```
 
 ```{r}
-compas_data <- readRDS("simulations/compas_data.rds")
+compas_data <- readRDS("simulations_compas_data.rds")
 ```
 
 ```{r}
-mat = compas_data[[1]][[1]]$Y
-true_coords = compas_data[[1]][[1]]$true_coords
-k = 2
-sim = 1
-niter = 10000
-nburnin = 5000
-thin = 5
-nchains = 3
-max_clus = 3
-max_attempts = 2
-
-
-one_sim(
+test <- one_sim(
   mat = compas_data[[1]][[1]]$Y,
   true_coords = compas_data[[1]][[1]]$true_coords,
   k = 2, 
