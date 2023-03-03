@@ -271,18 +271,9 @@ coral_code <- nimbleCode({
   pi[1:K] ~ ddirch(ones[1:K])
   
   ### table parameters - fix covariance as identity
-  for(dim in 1:d){
-    mu[1, dim] = -sum(mu[2:K, dim])
+  for(i in 1:K){
+    mu[i, 1:d] ~ dmnorm(mu0[1:d], Lambda0[1:d, 1:d])
   }
-  for(clus in 2:K){
-    for(dim in 1:d){
-      mu[clus, dim] ~ dnorm(0, var = 10)
-    }
-  }
-  # for(i in 1:max_clus){
-  #   mu[i, 1:d] ~ dmnorm(mu0[1:d], Lambda0[1:d, 1:d])
-  # }
-  
   
   for(site in 1:nsites){
     # identity matrix for constraint
@@ -400,7 +391,7 @@ init_func <- function(mat, d = 2, max_clus){
     phi = runif(1)
   )
 }
-fit_model <- function(seed = 1, code, data, constants, inits, niter, nchains, thin = 1, burnin = 0){
+fit_model <- function(seed = 1, code, data, constants, inits, niter, nchains, thin = 1, burnin = 0, addMoni = c("clus_id", "z")){
   library(nimble)
   
   # R model
@@ -411,7 +402,10 @@ fit_model <- function(seed = 1, code, data, constants, inits, niter, nchains, th
   
   # R mcmc
   model_conf <- configureMCMC(model)
-  # model_conf$addMonitors(c("clus_id", "z"))
+  if(!is.null(addMoni)){
+    model_conf$addMonitors(addMoni)
+  }
+  
   
   # R mcmc
   mcmc <- buildMCMC(model_conf)
@@ -823,21 +817,22 @@ get_waic_k1 <- function(Y, coral_fit, verbose = F){
 }
 
 # functions for simulation
-mat = compas_data[[1]][[1]]$Y
-true_coords = compas_data[[1]][[1]]$true_coords
-k = 2
-sim = 1
-niter = 50000
-nburnin = 25000
-thin = 5
-nchains = 3
-max_clus = 3
-max_attempts = 2
+# mat = compas_data[[1]][[1]]$Y
+# true_coords = compas_data[[1]][[1]]$true_coords
+# k = 2
+# sim = 1
+# niter = 100000
+# nburnin = 50000
+# thin = 5
+# nchains = 3
+# max_clus = 8
+# max_attempts = 6
 one_sim <- function(mat, true_coords, k, sim, niter = 75000, nchains = 3, nburnin = 25000, thin = 5, max_clus = 8, max_attempts = 10){
   # function to run one iteration of simulation
   out <- list()
   procrust <- matrix(NA, 3, 2)
-  pairwise_clus_prop <- matrix(NA, 3, 1)
+  pairwise_clus_prop <- matrix(NA, 6, 1)
+  nclus_out <- matrix(NA, 6, 1)
   conv_check <- matrix(1, 3, 1)
   
   # start with ordination techniques: dpord, coral, nmds
@@ -876,7 +871,10 @@ one_sim <- function(mat, true_coords, k, sim, niter = 75000, nchains = 3, nburni
     )
     stopCluster(this_cluster)
     dpord_end <- Sys.time()
-    dpord_sum <- summarize_dpord(dpord_fit)
+    dpord_sum <- try(
+      summarize_dpord(dpord_fit), 
+      silent = T
+    )
     if(length(dpord_sum) == 1){
       dpord_rhat <- 999
     } else{
@@ -893,6 +891,7 @@ one_sim <- function(mat, true_coords, k, sim, niter = 75000, nchains = 3, nburni
     procrust[1,1] <- NA
     procrust[1,2] <- NA
     pairwise_clus_prop[1,1] <- NA
+    nclus_out[1,1] <- NA
     conv_check[1,] <- 0
   } else{
     tmp <- vegan::procrustes(
@@ -909,8 +908,8 @@ one_sim <- function(mat, true_coords, k, sim, niter = 75000, nchains = 3, nburni
       rep(1:k, each = 15),
       dpord_sum$z_tbl$modal_clus
     )
+    nclus_out[1,1] <- dpord_sum$modal_nclus
   }
-  
   
   ## coral model (fit k = 1, ..., max_clus)
   ### using nimble code I wrote for fair assessment
@@ -1003,8 +1002,10 @@ one_sim <- function(mat, true_coords, k, sim, niter = 75000, nchains = 3, nburni
         stopCluster(this_cluster)
         coral_end <- Sys.time()
         
-        # separate waic and samples
-        coral_sum <- summarize_coral(coral_fit, k = ndx)
+        coral_sum <- try(
+          summarize_coral(coral_fit, k = ndx), 
+          silent = T
+        )
         if(length(coral_sum) == 1){
           waic[ndx,1] <- NA
           runtimes[ndx,1] <- as.numeric(coral_end - coral_start, units = "secs")
@@ -1027,15 +1028,16 @@ one_sim <- function(mat, true_coords, k, sim, niter = 75000, nchains = 3, nburni
     procrust[2,1] <- NA
     procrust[2,2] <- NA
     pairwise_clus_prop[2,1] <- NA
-    conv_check[2,] <- 0
+    nclus_out[2,1] <- NA
+    conv_check[2,1] <- 0
   } else if(sum(!is.na(waic[-1,])) == 0){
-    conv_check[2,] <- 0
+    conv_check[2,1] <- 0
+    nclus_out[2,1] <- 1
     waic_ <- na.omit(waic)
     coral_sum <- readRDS(
       paste0(
         "simulations/summaries/coral_sum", 
-        which(c(waic_) == min(c(waic_))),
-        # 3,
+        1,
         "_", k, "_", sim, ".rds"
       )
     )
@@ -1063,8 +1065,7 @@ one_sim <- function(mat, true_coords, k, sim, niter = 75000, nchains = 3, nburni
     coral_sum <- readRDS(
       paste0(
         "simulations/summaries/coral_sum", 
-        which(c(waic) == min(c(waic))),
-        # 3,
+        which(c(waic) == min(c(waic), na.rm = T)),
         "_", k, "_", sim, ".rds"
       )
     )
@@ -1088,6 +1089,7 @@ one_sim <- function(mat, true_coords, k, sim, niter = 75000, nchains = 3, nburni
       rep(1:k, each = 15),
       coral_sum$z_tbl$modal_clus
     )
+    nclus_out[2,1] <- coral_sum$modal_nclus
   }
   
   # nmds
@@ -1140,30 +1142,98 @@ one_sim <- function(mat, true_coords, k, sim, niter = 75000, nchains = 3, nburni
     )
   )
   
-  return(ordination)
+  # clustering techniques
+  # algorithmic techniques
+  ## maximize silhouette distance with ward clustering
+  bray_dist <- as.matrix(vegan::vegdist(mat, method = "bray"))
+  ward <- cluster::agnes(
+    x = bray_dist,
+    diss = TRUE,
+    method = "ward"
+  )
+  ward_sil <- sapply(
+    2:max_clus, function(x){
+      mean(silhouette(cutree(ward, k = x), bray_dist)[,3])
+    }
+  )
+  ward_nclus <- (2:max_clus)[which(ward_sil == max(ward_sil))]
+  ward_clus <- cutree(ward, ward_nclus)
+  pairwise_clus_prop[3,1] <- prop_correct_pairwise(
+    rep(1:k, each = 15),
+    ward_clus
+  )
+  nclus_out[3,1] <- ward_nclus
+
+  ## pam with bray curtis, maximizing sil dist
+  pam <- lapply(
+    2:max_clus, function(x){
+      cluster::pam(
+        x = bray_dist,
+        k = x,
+        diss = "TRUE",
+      )
+    }
+  )
+  pam_sil <- sapply(
+    pam, function(x){
+      mean(silhouette(x$clustering, bray_dist)[,3])
+    }
+  )
+  pam_nclus <- (2:max_clus)[which(pam_sil == max(pam_sil))]
+  pam_clus <- pam[[which(pam_sil == max(pam_sil))]]$clustering
+  pairwise_clus_prop[4,1] <- prop_correct_pairwise(
+    rep(1:k, each = 15),
+    pam_clus
+  )
+  nclus_out[4,1] <- pam_nclus
   
-  # # clustering techniques
-  # # algorithmic techniques
-  # ## maximize silhouette distance with ward clustering
-  # bray_dist <- as.matrix(vegan::vegdist(mat, method = "bray"))
-  # ward <- cluster::agnes(
-  #   x = bray_dist,
-  #   diss = TRUE,
-  #   method = "ward"
-  # )
-  # ward_sil <- sapply(
-  #   2:max_clus, function(x){
-  #     mean(silhouette(cutree(ward, k = x), bray_dist)[,3])
-  #   }
-  # )
-  # ward_nclus <- (2:max_clus)[which(ward_sil == max(ward_sil))]
-  # ward_clus <- cutree(ward, ward_nclus)
-  # pairwise_clus_prop[3,1] <- prop_correct_pairwise(
-  #   rep(1:k, each = 15),
-  #   ward_clus
-  # )
-  # 
-  # ##
- 
+  ## k-means with cal
+  ch <- sapply(
+    2:max_clus, function(x){
+      kmeans <- kmeans(mat, x)
+      vegan::cIndexKM(kmeans, mat)[1]
+    }
+  )
+  ssi <- sapply(
+    2:max_clus, function(x){
+      kmeans <- kmeans(mat, x)
+      vegan::cIndexKM(kmeans, mat)[2]
+    }
+  )
+  
+  pairwise_clus_prop[5, 1] <- prop_correct_pairwise(
+    rep(1:k, each = 15),
+    kmeans(mat, (2:max_clus)[which(ch == max(ch))])$cluster
+  )
+  nclus_out[5,1] <- (2:max_clus)[which(ch == max(ch))]
+  
+  pairwise_clus_prop[6, 1] <- prop_correct_pairwise(
+    rep(1:k, each = 15),
+    kmeans(mat, (2:max_clus)[which(ssi == max(ssi))])$cluster
+  )
+  nclus_out[6,1] <- (2:max_clus)[which(ssi == max(ssi))]
+  
+  ordination <- tibble(
+    method = c('dpord', "coral", "ward", "pam", "ch", "ssi"),
+    pairwise_clus_prop = c(pairwise_clus_prop),
+    nclus = c(nclus_out)
+  ) %>%
+    mutate(
+      k = k,
+      sim = sim
+    )
+  saveRDS(
+    clustering, 
+    file = paste0(
+      "simulations/agg_summaries/clustering_", k, "_", "sim", ".rds"
+    )
+  )
+  
+  return(
+    list(
+      ordination = ordination,
+      clustering = clustering
+    )
+  )
   
 }

@@ -19,25 +19,18 @@ coral_code <- nimbleCode({
   pi[1:K] ~ ddirch(ones[1:K])
   
   ### table parameters - fix covariance as identity
-  # for(dim in 1:d){
-  #   mu[1, dim] <- -sum(mu[2:K, dim])
-  # }
-  for(clus in 1:K){
-    for(dim in 1:d){
-      mu[clus, dim] ~ dnorm(0, var = 10)
-    }
+  mu1[1] <- -sum(mu1[2:K])
+  mu2[1] <- -sum(mu2[2:K])
+  for(clus in 2:K){
+    mu1[clus] ~ dnorm(0, var = 10)
+    mu2[clus] ~ dnorm(0, var = 10)
   }
-  # for(i in 1:K){
-  #   mu[i, 1:d] ~ dmnorm(mu0[1:d], Lambda0[1:d, 1:d])
-  # }
+
   
   
   for(site in 1:nsites){
-    for(dim in 1:d){
-      z[site, dim] ~ dnorm(mu[clus_id[site], dim], var = 1)
-    }
-    # # identity matrix for constraint
-    # z[site, 1:d] ~ dmnorm(mu[clus_id[site], 1:d], cov = S[1:d, 1:d])
+    z[site,1] ~ dnorm(mu1[clus_id[site]], 1)
+    z[site,2] ~ dnorm(mu2[clus_id[site]], 1)
   }
   
   # theta prior
@@ -99,8 +92,16 @@ init_func <- function(mat, d = 2, max_clus){
 
 # fit model
 ndx <- 2
-init <- init_func(mat, d = 2, max_clus = 2)
-init$clus_id <- rep(1, nrow(mat))
+
+init <- list(
+  alpha = rnorm(30),
+  beta = rnorm(27),
+  mu1 = rnorm(2),
+  mu2 = rnorm(2),
+  clus_id = sample(c(1:2), 30, replace = T)
+)
+
+
 test <- fit_model(
   seed = 1,
   code = coral_code,
@@ -118,8 +119,33 @@ test <- fit_model(
     ones = rep(1, ndx)
   ),
   inits = init,
-  niter = niter,
-  burnin = nburnin,
+  niter = 50000,
+  burnin = 25000,
   nchains = 1,
-  thin = thin
+  thin = 5
 )
+colnames(test)
+test[,85]
+
+# step by step
+model <- nimbleModel(
+  code = coral_code,
+  data = list(
+    Y = mat
+  ),
+  constants = list(
+    nsites = nrow(mat),
+    nspecies = ncol(mat),
+    d = 2,
+    K = ndx,
+    S = diag(2),
+    mu0 = rep(0, 2),
+    Lambda0 = diag(2),
+    ones = rep(1, ndx)
+  ),
+  inits = init
+)
+
+cmodel <- compileNimble(model)
+
+

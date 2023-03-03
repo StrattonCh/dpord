@@ -43,7 +43,8 @@ test <- fit_model(
   niter = 10000,
   burnin = 5000,
   nchains = 3,
-  thin = 1
+  thin = 1,
+  addMoni = NULL
 )
 colMeans(
   do.call("rbind", test)
