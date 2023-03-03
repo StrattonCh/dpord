@@ -1213,7 +1213,7 @@ one_sim <- function(mat, true_coords, k, sim, niter = 75000, nchains = 3, nburni
   )
   nclus_out[6,1] <- (2:max_clus)[which(ssi == max(ssi))]
   
-  ordination <- tibble(
+  clustering <- tibble(
     method = c('dpord', "coral", "ward", "pam", "ch", "ssi"),
     pairwise_clus_prop = c(pairwise_clus_prop),
     nclus = c(nclus_out)
