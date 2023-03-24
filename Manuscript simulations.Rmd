@@ -528,17 +528,18 @@ sim_tbl <- tibble(
 run_sims <- function(sim_tbl, niter = 150000, nchains = 3, nburnin = 100000, thin = 5, max_clus = 8, max_attempts = 6){
   out <- list()
   for(i in 1:nrow(sim_tbl)){
-    # message
-    message(paste0("Beginning sim ", i, " of ", nrow_sim_tbl))
-    
     # grab sim params
     k_ <- sim_tbl$k[i]
     sim_ <- sim_tbl$sim[i]
+    total_sim <- max(sim_tbl$sim) * (max(sim_tbl$k)-1)
+    
+    # message
+    message(paste0("Beginning sim ", sim_, " of ", total_sim))
     
     # run one sim
     onerun <- one_sim(
-      mat = compas_data[[k_]][[sim_]]$Y,
-      true_coords = compas_data[[k_]][[sim_]]$true_coords,
+      mat = compas_data[[k_-1]][[sim_]]$Y,
+      true_coords = compas_data[[k_-1]][[sim_]]$true_coords,
       k = k_, 
       sim = sim_, 
       niter = niter,
@@ -550,7 +551,7 @@ run_sims <- function(sim_tbl, niter = 150000, nchains = 3, nburnin = 100000, thi
     )
     saveRDS(
       onerun, 
-      paste0("simulations/agg_summaries/", onerun, "_", i, ".rds")
+      paste0("simulations/agg_summaries/onerun_", k_, "_", sim_, ".rds")
     )
     out[[i]] <- onerun
   }
@@ -558,14 +559,99 @@ run_sims <- function(sim_tbl, niter = 150000, nchains = 3, nburnin = 100000, thi
 }
 sims <- run_sims(
   sim_tbl,
-  niter = 150000, 
+  niter = 100000, 
   nchains = 3,
-  nburnin = 100000, 
+  nburnin = 50000, 
   thin = 5, 
   max_clus = 8, 
   max_attempts = 6
 )
-saveRDS(sims, "simulations/agg_summaries/sims.rds")
 ```
 
+## Summarize K = 2
 
+```{r}
+clustering_list <- list()
+ordination_list <- list()
+onerun_files <- list.files("simulations/agg_summaries")
+target_files <- onerun_files[grepl("onerun_2_", onerun_files)]
+for(i in 1:length(target_files)){
+  clustering_list[[i]] <- readRDS(paste0("simulations/agg_summaries/",target_files[i]))$clustering
+  ordination_list[[i]] <- readRDS(paste0("simulations/agg_summaries/",target_files[i]))$ordination
+}
+
+# summarize clustering
+clustering <- do.call("rbind", clustering_list)
+sim_exclude <- clustering %>%
+  group_by(sim) %>%
+  summarize(sum_clus = sum(nclus)) %>%
+  filter(is.na(sum_clus)) %>%
+  dplyr::select(sim) %>% unlist %>% unname
+
+clustering %>% 
+  filter(sim %notin% sim_exclude) %>%
+  group_by(method) %>%
+  mutate(
+    nclus_1 = ifelse(nclus == 1, 1, 0),
+    nclus_2 = ifelse(nclus == 2, 1, 0),
+    nclus_3 = ifelse(nclus == 3, 1, 0),
+    nclus_4 = ifelse(nclus == 4, 1, 0),
+    nclus_5 = ifelse(nclus == 5, 1, 0),
+    nclus_6 = ifelse(nclus == 6, 1, 0),
+    nclus_gr6 = ifelse(nclus > 6, 1, 0)
+  ) %>%
+  group_by(method) %>%
+  summarize(
+    nclus_1 = sum(nclus_1),
+    nclus_2 = sum(nclus_2),
+    nclus_3 = sum(nclus_3),
+    nclus_4 = sum(nclus_4),
+    nclus_5 = sum(nclus_5),
+    nclus_6 = sum(nclus_6),
+    nclus_gr6 = sum(nclus_gr6)
+  )
+
+clustering %>% 
+  filter(sim %notin% sim_exclude) %>%
+  group_by(method) %>%
+  summarize(
+    mean_pairwise = mean(pairwise_clus_prop)
+  )
+  
+# summarize ordination
+ordination <- do.call("rbind", ordination_list)
+sim_exclude <- ordination %>%
+  group_by(sim) %>%
+  summarize(sum_procrustes = sum(procrustes_true)) %>%
+  filter(is.na(sum_procrustes)) %>%
+  dplyr::select(sim) %>% unlist %>% unname
+
+ordination %>% 
+  filter(sim %notin% sim_exclude) %>%
+  group_by(method) %>%
+  mutate(
+    nclus_1 = ifelse(nclus == 1, 1, 0),
+    nclus_2 = ifelse(nclus == 2, 1, 0),
+    nclus_3 = ifelse(nclus == 3, 1, 0),
+    nclus_4 = ifelse(nclus == 4, 1, 0),
+    nclus_5 = ifelse(nclus == 5, 1, 0),
+    nclus_6 = ifelse(nclus == 6, 1, 0),
+    nclus_gr6 = ifelse(nclus > 6, 1, 0)
+  ) %>%
+  group_by(method) %>%
+  summarize(
+    nclus_1 = sum(nclus_1),
+    nclus_2 = sum(nclus_2),
+    nclus_3 = sum(nclus_3),
+    nclus_4 = sum(nclus_4),
+    nclus_5 = sum(nclus_5),
+    nclus_6 = sum(nclus_6),
+    nclus_gr6 = sum(nclus_gr6)
+  )
+
+
+
+
+
+
+```

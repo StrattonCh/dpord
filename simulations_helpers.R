@@ -817,14 +817,14 @@ get_waic_k1 <- function(Y, coral_fit, verbose = F){
 }
 
 # functions for simulation
-# mat = compas_data[[1]][[1]]$Y
-# true_coords = compas_data[[1]][[1]]$true_coords
+# mat = compas_data[[1]][[25]]$Y
+# true_coords = compas_data[[1]][[25]]$true_coords
 # k = 2
-# sim = 1
+# sim = 25
 # niter = 100000
-# nburnin = 50000
-# thin = 5
 # nchains = 3
+# nburnin = 50000 
+# thin = 5
 # max_clus = 8
 # max_attempts = 6
 one_sim <- function(mat, true_coords, k, sim, niter = 75000, nchains = 3, nburnin = 25000, thin = 5, max_clus = 8, max_attempts = 10){
@@ -957,7 +957,8 @@ one_sim <- function(mat, true_coords, k, sim, niter = 75000, nchains = 3, nburni
           nclus = 1,
           runtime = as.numeric(coral_end - coral_start, units = "secs"),
           z_tbl = get_ztbl_k1(coral_fit),
-          waic = get_waic_k1(mat, coral_fit, verbose = F)
+          waic = get_waic_k1(mat, coral_fit, verbose = F),
+          modal_nclus = 1
         )
         
         coral_rhat <- max(coral_sum$conv$rhat, na.rm = T)
@@ -1089,7 +1090,7 @@ one_sim <- function(mat, true_coords, k, sim, niter = 75000, nchains = 3, nburni
       rep(1:k, each = 15),
       coral_sum$z_tbl$modal_clus
     )
-    nclus_out[2,1] <- coral_sum$modal_nclus
+    nclus_out[2,1] <- coral_sum$modal_nclus[1]
   }
   
   # nmds
@@ -1138,7 +1139,7 @@ one_sim <- function(mat, true_coords, k, sim, niter = 75000, nchains = 3, nburni
   saveRDS(
     ordination, 
     file = paste0(
-      "simulations/agg_summaries/ordination_", k, "_", "sim", ".rds"
+      "simulations/agg_summaries/ordination_", k, "_", sim, ".rds"
     )
   )
   
@@ -1225,7 +1226,7 @@ one_sim <- function(mat, true_coords, k, sim, niter = 75000, nchains = 3, nburni
   saveRDS(
     clustering, 
     file = paste0(
-      "simulations/agg_summaries/clustering_", k, "_", "sim", ".rds"
+      "simulations/agg_summaries/clustering_", k, "_", sim, ".rds"
     )
   )
   
